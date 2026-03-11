@@ -10,7 +10,7 @@ use std::{
 use bytes::Bytes;
 use heed::{
     Database, Env, EnvOpenOptions,
-    types::{SerdeBincode, Str},
+    types::{Bytes as HeedBytes, SerdeBincode, Str, Unit},
 };
 use http_body_util::{BodyExt, Empty};
 use hyper::{Method, Request, StatusCode};
@@ -22,10 +22,11 @@ use serde_json::{Map, Value};
 use tokio::sync::{Mutex, Notify};
 
 const GOOGLE_CACHE_TTL_SECS: u64 = 300;
-const METADATA_DB: &str = "metadata";
-const VALUES_DB: &str = "values";
+const CACHE_DB: &str = "cache";
+const EXPIRY_DB: &str = "expiry";
 
 type CacheDb = Database<Str, SerdeBincode<CacheEntry>>;
+type ExpiryDb = Database<HeedBytes, Unit>;
 type CacheResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Empty<Bytes>>;
 
@@ -208,8 +209,8 @@ impl GoogleSheetsClient {
 #[derive(Clone)]
 struct HeedCache {
     env: Env,
-    metadata: CacheDb,
-    values: CacheDb,
+    entries: CacheDb,
+    expiry: ExpiryDb,
 }
 
 impl HeedCache {
@@ -218,59 +219,94 @@ impl HeedCache {
 
         let env = unsafe { EnvOpenOptions::new().max_dbs(4).open(path.as_ref())? };
         let mut wtxn = env.write_txn()?;
-        let metadata = env.create_database(&mut wtxn, Some(METADATA_DB))?;
-        let values = env.create_database(&mut wtxn, Some(VALUES_DB))?;
+        let entries = env.create_database(&mut wtxn, Some(CACHE_DB))?;
+        let expiry = env.create_database(&mut wtxn, Some(EXPIRY_DB))?;
         wtxn.commit()?;
 
         Ok(Self {
             env,
-            metadata,
-            values,
+            entries,
+            expiry,
         })
     }
 
     fn get_metadata(&self, key: &str) -> CacheResult<Option<Bytes>> {
-        self.get(&self.metadata, key)
+        self.get(&cache_key_prefix("m", key))
     }
 
     fn put_metadata(&self, key: &str, body: &Bytes, ttl_seconds: u64) -> CacheResult<()> {
-        self.put(&self.metadata, key, body, ttl_seconds)
+        self.put(&cache_key_prefix("m", key), body, ttl_seconds)
     }
 
     fn get_values(&self, key: &str) -> CacheResult<Option<Bytes>> {
-        self.get(&self.values, key)
+        self.get(&cache_key_prefix("v", key))
     }
 
     fn put_values(&self, key: &str, body: &Bytes, ttl_seconds: u64) -> CacheResult<()> {
-        self.put(&self.values, key, body, ttl_seconds)
+        self.put(&cache_key_prefix("v", key), body, ttl_seconds)
     }
 
-    fn get(&self, db: &CacheDb, key: &str) -> CacheResult<Option<Bytes>> {
-        let now = now_unix_seconds();
+    fn get(&self, key: &str) -> CacheResult<Option<Bytes>> {
+        self.purge_expired()?;
         let rtxn = self.env.read_txn()?;
-        let entry = db.get(&rtxn, key)?;
-
-        match entry {
-            Some(entry) if entry.expires_at_unix_seconds > now => Ok(Some(Bytes::from(entry.body))),
-            Some(_) => {
-                drop(rtxn);
-                let mut wtxn = self.env.write_txn()?;
-                db.delete(&mut wtxn, key)?;
-                wtxn.commit()?;
-                Ok(None)
-            }
-            None => Ok(None),
-        }
+        Ok(self
+            .entries
+            .get(&rtxn, key)?
+            .map(|entry| Bytes::from(entry.body)))
     }
 
-    fn put(&self, db: &CacheDb, key: &str, body: &Bytes, ttl_seconds: u64) -> CacheResult<()> {
+    fn put(&self, key: &str, body: &Bytes, ttl_seconds: u64) -> CacheResult<()> {
+        self.purge_expired()?;
+
+        let expires_at_unix_seconds = now_unix_seconds() + ttl_seconds;
         let entry = CacheEntry {
             body: body.to_vec(),
-            expires_at_unix_seconds: now_unix_seconds() + ttl_seconds,
+            expires_at_unix_seconds,
         };
 
         let mut wtxn = self.env.write_txn()?;
-        db.put(&mut wtxn, key, &entry)?;
+        if let Some(previous) = self.entries.get(&wtxn, key)? {
+            let previous_expiry_key = expiry_key(previous.expires_at_unix_seconds, key);
+            self.expiry
+                .delete(&mut wtxn, previous_expiry_key.as_slice())?;
+        }
+        self.entries.put(&mut wtxn, key, &entry)?;
+        let expiry_key = expiry_key(expires_at_unix_seconds, key);
+        self.expiry.put(&mut wtxn, expiry_key.as_slice(), &())?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    fn purge_expired(&self) -> CacheResult<()> {
+        let now = now_unix_seconds();
+        let upper_bound = expiry_scan_upper_bound(now);
+
+        let expired_entries = {
+            let rtxn = self.env.read_txn()?;
+            let mut expired_entries = Vec::new();
+            let iter = self.expiry.iter(&rtxn)?;
+
+            for result in iter {
+                let (key, _) = result?;
+                if key > upper_bound.as_slice() {
+                    break;
+                }
+                expired_entries.push(key.to_vec());
+            }
+
+            expired_entries
+        };
+
+        if expired_entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut wtxn = self.env.write_txn()?;
+        for expiry_key in expired_entries {
+            let cache_key = expiry_key_cache_key(&expiry_key)?;
+            self.entries.delete(&mut wtxn, cache_key)?;
+            self.expiry.delete(&mut wtxn, expiry_key.as_slice())?;
+        }
         wtxn.commit()?;
         Ok(())
     }
@@ -280,6 +316,35 @@ impl HeedCache {
 struct CacheEntry {
     body: Vec<u8>,
     expires_at_unix_seconds: u64,
+}
+
+fn expiry_key(expires_at_unix_seconds: u64, cache_key: &str) -> Vec<u8> {
+    let key_bytes = cache_key.as_bytes();
+    let mut encoded = Vec::with_capacity(8 + key_bytes.len());
+    encoded.extend_from_slice(&expires_at_unix_seconds.to_be_bytes());
+    encoded.extend_from_slice(key_bytes);
+    encoded
+}
+
+fn expiry_scan_upper_bound(now_unix_seconds: u64) -> Vec<u8> {
+    let mut upper_bound = Vec::with_capacity(9);
+    upper_bound.extend_from_slice(&now_unix_seconds.to_be_bytes());
+    upper_bound.push(0xff);
+    upper_bound
+}
+
+fn expiry_key_cache_key(expiry_key: &[u8]) -> CacheResult<&str> {
+    Ok(std::str::from_utf8(
+        expiry_key.get(8..).ok_or("invalid expiry key")?,
+    )?)
+}
+
+fn cache_key_prefix(kind: &str, key: &str) -> String {
+    let mut prefixed = String::with_capacity(kind.len() + 1 + key.len());
+    prefixed.push_str(kind);
+    prefixed.push(':');
+    prefixed.push_str(key);
+    prefixed
 }
 
 #[derive(Clone, Default)]
@@ -519,6 +584,7 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
+        thread,
         time::Duration,
     };
 
@@ -528,7 +594,9 @@ mod tests {
     use tempfile::{TempDir, tempdir};
     use tokio::time::sleep;
 
-    use super::{GoogleError, GoogleSheetsClient, InflightRequests};
+    use super::{
+        GoogleError, GoogleSheetsClient, HeedCache, InflightRequests, cache_key_prefix, expiry_key,
+    };
 
     fn live_client() -> Option<(GoogleSheetsClient, String, TempDir)> {
         let _ = dotenvy::dotenv();
@@ -650,5 +718,79 @@ mod tests {
 
         let payload: Value = serde_json::from_slice(&json).expect("valid JSON response");
         assert!(payload.is_array());
+    }
+
+    #[test]
+    fn expired_entry_is_removed_on_direct_read() {
+        let dir = tempdir().expect("tempdir");
+        let cache = HeedCache::open(dir.path()).expect("open cache");
+        let payload = Bytes::from_static(b"payload");
+
+        cache
+            .put_metadata("metadata:test", &payload, 0)
+            .expect("put metadata");
+
+        assert_eq!(
+            cache.get_metadata("metadata:test").expect("get metadata"),
+            None
+        );
+
+        let rtxn = cache.env.read_txn().expect("read txn");
+        assert!(
+            cache
+                .entries
+                .get(&rtxn, cache_key_prefix("m", "metadata:test").as_str())
+                .expect("raw metadata get")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unrelated_read_sweeps_cold_expired_entries() {
+        let dir = tempdir().expect("tempdir");
+        let cache = HeedCache::open(dir.path()).expect("open cache");
+        let payload = Bytes::from_static(b"payload");
+
+        cache
+            .put_values("values:expired", &payload, 1)
+            .expect("put expired value");
+
+        let expired_index_key = {
+            let rtxn = cache.env.read_txn().expect("read txn");
+            let prefixed_key = cache_key_prefix("v", "values:expired");
+            let entry = cache
+                .entries
+                .get(&rtxn, prefixed_key.as_str())
+                .expect("raw expired value get")
+                .expect("expired value entry");
+            expiry_key(entry.expires_at_unix_seconds, prefixed_key.as_str())
+        };
+
+        thread::sleep(Duration::from_secs(1));
+
+        cache
+            .put_values("values:fresh", &payload, 60)
+            .expect("put fresh value");
+
+        assert_eq!(
+            cache.get_values("values:fresh").expect("get fresh value"),
+            Some(payload.clone())
+        );
+
+        let rtxn = cache.env.read_txn().expect("read txn");
+        assert!(
+            cache
+                .entries
+                .get(&rtxn, cache_key_prefix("v", "values:expired").as_str())
+                .expect("raw expired value get")
+                .is_none()
+        );
+        assert_eq!(
+            cache
+                .expiry
+                .get(&rtxn, expired_index_key.as_slice())
+                .expect("raw expiry get"),
+            None
+        );
     }
 }

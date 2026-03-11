@@ -66,8 +66,8 @@ Used for every successful data request after the sheet title is known.
   - `Content-Type: application/json`
   - `Access-Control-Allow-Origin: *`
   - `Access-Control-Allow-Headers: Origin, X-Requested-With, Content-Type, Accept`
-- successful sheet responses include randomized cache headers:
-  - `Cache-Control: public, max-age={30-60}, s-maxage={30-60}`
+- successful sheet responses include:
+  - `Cache-Control: public, max-age=60, s-maxage=60`
 - error responses include:
   - `Cache-Control: public, max-age=30, s-maxage=30`
 
@@ -89,9 +89,7 @@ All handled errors return:
 - in-memory pending-request dedupe keyed by full request URL
 - 1% sampled analytics write to SQL by `(hour, sheet_id)`
 
-## Rust migration plan
-
-### Implemented in the first Rust slice
+## Current Rust implementation
 
 - lightweight HTTP server using `hyper`
 - route surface: `/`, `/up`, `/:id/:sheet`, fallback `404`
@@ -99,26 +97,13 @@ All handled errors return:
 - numeric sheet resolution via spreadsheet metadata lookup
 - sheet values lookup
 - row-to-object JSON transformation
-- CORS and cache headers
+- CORS and fixed cache headers
 - JSON error format
+- `heed` cache for raw Google metadata payloads
+- `heed` cache for raw Google values payloads
+- in-process dedupe for in-flight upstream Google fetches
 
-### Selected Rust replacements
-
-- metadata cache: `heed` instead of Redis
-- values cache: `heed` instead of Redis
-- request coalescing: keep an in-process pending-request map
-- analytics: keep as a separate concern from caching
-
-Reasoning:
-- the Rust port caches Google-origin payloads as the source of truth
-- final response shaping happens after cache retrieval
-- `heed` gives a local embedded cache without introducing another service dependency
-- LMDB-style storage does not replace the in-flight request dedupe logic, so that stays separate
-
-### Deferred to follow-up slices
-
-- `heed` spreadsheet metadata cache with 300 second TTL
-- `heed` sheet values cache with 300 second TTL
-- pending request coalescing
-- sampled SQL analytics
-- parity tests against the Bun implementation
+Notes:
+- the Rust service caches raw Google responses and shapes them after cache retrieval
+- expired `heed` entries are deleted on read instead of accumulating indefinitely
+- analytics is still not implemented

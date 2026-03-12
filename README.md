@@ -31,8 +31,10 @@ PORT=8080
 Then run:
 
 ```sh
-docker compose up --build -d
+docker compose up -d
 ```
+
+By default this pulls `ghcr.io/devazuka/gsheet:latest`.
 
 The service listens on `http://localhost:8080` by default and stores its LMDB cache in the `gsheet-data` Docker volume.
 
@@ -74,14 +76,15 @@ Minimal VPS flow:
 git clone https://github.com/devazuka/gsheet.git
 cd gsheet
 printf 'GOOGLE_API_KEY=your_google_api_key\nPORT=8080\n' > .env
-docker compose up --build -d
+docker compose up -d
 ```
 
 Update in place:
 
 ```sh
 git pull
-docker compose up --build -d
+docker compose pull
+docker compose up -d
 ```
 
 ## Routes

@@ -1,6 +1,7 @@
 services:
   gsheet:
-    build: .
+    image: ghcr.io/devazuka/gsheet:latest
+    pull_policy: always
     restart: unless-stopped
     ports:
       - "${PORT:-8080}:8080"

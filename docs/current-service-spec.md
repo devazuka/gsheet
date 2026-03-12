@@ -1,7 +1,5 @@
 # Current service spec
 
-This document extracts the behavior implemented in [`base.ts`](/home/cdenis/Documents/gsheet/base.ts).
-
 ## Core Google Sheets API calls
 
 ### 1. Spreadsheet metadata lookup
@@ -72,8 +70,10 @@ Used for every successful sheet data request once the sheet title is known.
   - `Content-Type: application/json`
   - `Access-Control-Allow-Origin: *`
   - `Access-Control-Allow-Headers: Origin, X-Requested-With, Content-Type, Accept`
-- successful sheet responses include:
-  - `Cache-Control: public, max-age=60, s-maxage=60` by default
+- successful single-sheet responses include:
+  - `Cache-Control: public, max-age=300, s-maxage=300` by default
+- successful whole-document responses include:
+  - `Cache-Control: public, max-age=3600, s-maxage=3600` by default
 - error responses include:
   - `Cache-Control: public, max-age=30, s-maxage=30` by default
 - upstream Google cache entries start at `300` seconds by default
@@ -90,7 +90,8 @@ Used for every successful sheet data request once the sheet title is known.
 
 All of these are optional and keep the current defaults when unset:
 
-- `SUCCESS_MAX_AGE_SECS`
+- `SHEET_MAX_AGE_SECS`
+- `DOCUMENT_MAX_AGE_SECS`
 - `ERROR_MAX_AGE_SECS`
 - `GOOGLE_CACHE_TTL_SECS`
 - `GOOGLE_CACHE_TTL_MAX_SECS`

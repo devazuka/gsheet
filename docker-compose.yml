@@ -1,0 +1,22 @@
+services:
+  gsheet:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      GOOGLE_API_KEY: "${GOOGLE_API_KEY:?set GOOGLE_API_KEY in .env or your shell}"
+      CACHE_DIR: /data
+      SHEET_MAX_AGE_SECS: "${SHEET_MAX_AGE_SECS:-300}"
+      DOCUMENT_MAX_AGE_SECS: "${DOCUMENT_MAX_AGE_SECS:-3600}"
+      ERROR_MAX_AGE_SECS: "${ERROR_MAX_AGE_SECS:-30}"
+      GOOGLE_CACHE_TTL_SECS: "${GOOGLE_CACHE_TTL_SECS:-300}"
+      GOOGLE_CACHE_TTL_MAX_SECS: "${GOOGLE_CACHE_TTL_MAX_SECS:-1200}"
+      GOOGLE_RATE_LIMIT: "${GOOGLE_RATE_LIMIT:-300}"
+      GOOGLE_RATE_WINDOW_SECS: "${GOOGLE_RATE_WINDOW_SECS:-60}"
+      GOOGLE_MAX_QUEUED_REQUESTS: "${GOOGLE_MAX_QUEUED_REQUESTS:-64}"
+    volumes:
+      - gsheet-data:/data
+
+volumes:
+  gsheet-data:

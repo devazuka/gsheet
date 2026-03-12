@@ -42,7 +42,8 @@ const README_URL: &str = "https://github.com/devazuka/gsheet#readme";
 const BASE_ALLOWED_HEADERS: &str = "Origin, X-Requested-With, Content-Type, Accept";
 const ROUTE_FORMAT: &str =
     "URL format is /spreadsheet_id[/sheet_name] or /raw/spreadsheet_id[/sheet_name]";
-const DEFAULT_SUCCESS_MAX_AGE_SECS: u64 = 60;
+const DEFAULT_SHEET_MAX_AGE_SECS: u64 = 300;
+const DEFAULT_DOCUMENT_MAX_AGE_SECS: u64 = 3600;
 const DEFAULT_ERROR_MAX_AGE_SECS: u64 = 30;
 const DEFAULT_GOOGLE_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_GOOGLE_CACHE_TTL_MAX_SECS: u64 = 1200;
@@ -65,7 +66,8 @@ static GOOGLE_RATE_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_GOOGLE_RATE_LIM
 static GOOGLE_RATE_WINDOW_SECS: AtomicU64 = AtomicU64::new(DEFAULT_GOOGLE_RATE_WINDOW_SECS);
 static GOOGLE_MAX_QUEUED_REQUESTS: AtomicUsize =
     AtomicUsize::new(DEFAULT_GOOGLE_MAX_QUEUED_REQUESTS);
-static SUCCESS_CACHE_CONTROL: OnceLock<String> = OnceLock::new();
+static SHEET_CACHE_CONTROL: OnceLock<String> = OnceLock::new();
+static DOCUMENT_CACHE_CONTROL: OnceLock<String> = OnceLock::new();
 static ERROR_CACHE_CONTROL: OnceLock<String> = OnceLock::new();
 static GOOGLE_QUEUE: OnceLock<Semaphore> = OnceLock::new();
 static GOOGLE_RECENT: OnceLock<Mutex<VecDeque<Instant>>> = OnceLock::new();
@@ -82,8 +84,9 @@ async fn main() {
     let port = env::var("PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(3000);
-    let success_max_age_secs = env_u64("SUCCESS_MAX_AGE_SECS", DEFAULT_SUCCESS_MAX_AGE_SECS);
+        .unwrap_or(8080);
+    let sheet_max_age_secs = env_u64("SHEET_MAX_AGE_SECS", DEFAULT_SHEET_MAX_AGE_SECS);
+    let document_max_age_secs = env_u64("DOCUMENT_MAX_AGE_SECS", DEFAULT_DOCUMENT_MAX_AGE_SECS);
     let error_max_age_secs = env_u64("ERROR_MAX_AGE_SECS", DEFAULT_ERROR_MAX_AGE_SECS);
     let google_cache_ttl_secs = env_u64("GOOGLE_CACHE_TTL_SECS", DEFAULT_GOOGLE_CACHE_TTL_SECS);
     let google_cache_ttl_max_secs = env_u64(
@@ -104,8 +107,11 @@ async fn main() {
     GOOGLE_MAX_QUEUED_REQUESTS.store(google_max_queued_requests, Ordering::Relaxed);
     let _ = GOOGLE_QUEUE.set(Semaphore::new(google_max_queued_requests));
     let _ = GOOGLE_RECENT.set(Mutex::new(VecDeque::with_capacity(google_rate_limit)));
-    let _ = SUCCESS_CACHE_CONTROL.set(format!(
-        "public, max-age={success_max_age_secs}, s-maxage={success_max_age_secs}"
+    let _ = SHEET_CACHE_CONTROL.set(format!(
+        "public, max-age={sheet_max_age_secs}, s-maxage={sheet_max_age_secs}"
+    ));
+    let _ = DOCUMENT_CACHE_CONTROL.set(format!(
+        "public, max-age={document_max_age_secs}, s-maxage={document_max_age_secs}"
     ));
     let _ = ERROR_CACHE_CONTROL.set(format!(
         "public, max-age={error_max_age_secs}, s-maxage={error_max_age_secs}"
@@ -218,7 +224,15 @@ async fn route_request(method: &Method, uri: &hyper::Uri) -> Response<ResBody> {
     };
 
     match result {
-        Ok(body) => json_response(StatusCode::OK, success_cache_control(), body),
+        Ok(body) => json_response(
+            StatusCode::OK,
+            if sheet.is_some() {
+                sheet_cache_control()
+            } else {
+                document_cache_control()
+            },
+            body,
+        ),
         Err(error) => error_response(error.message, error.status),
     }
 }
@@ -699,10 +713,16 @@ fn google_recent() -> &'static Mutex<VecDeque<Instant>> {
         .expect("google recent queue is not initialized")
 }
 
-fn success_cache_control() -> &'static str {
-    SUCCESS_CACHE_CONTROL
+fn sheet_cache_control() -> &'static str {
+    SHEET_CACHE_CONTROL
         .get()
-        .expect("success cache control is not initialized")
+        .expect("sheet cache control is not initialized")
+}
+
+fn document_cache_control() -> &'static str {
+    DOCUMENT_CACHE_CONTROL
+        .get()
+        .expect("document cache control is not initialized")
 }
 
 fn error_cache_control() -> &'static str {
@@ -853,8 +873,11 @@ mod tests {
         let _ = GOOGLE_RECENT.set(Mutex::new(VecDeque::with_capacity(
             DEFAULT_GOOGLE_RATE_LIMIT,
         )));
-        let _ = SUCCESS_CACHE_CONTROL.set(format!(
-            "public, max-age={DEFAULT_SUCCESS_MAX_AGE_SECS}, s-maxage={DEFAULT_SUCCESS_MAX_AGE_SECS}"
+        let _ = SHEET_CACHE_CONTROL.set(format!(
+            "public, max-age={DEFAULT_SHEET_MAX_AGE_SECS}, s-maxage={DEFAULT_SHEET_MAX_AGE_SECS}"
+        ));
+        let _ = DOCUMENT_CACHE_CONTROL.set(format!(
+            "public, max-age={DEFAULT_DOCUMENT_MAX_AGE_SECS}, s-maxage={DEFAULT_DOCUMENT_MAX_AGE_SECS}"
         ));
         let _ = ERROR_CACHE_CONTROL.set(format!(
             "public, max-age={DEFAULT_ERROR_MAX_AGE_SECS}, s-maxage={DEFAULT_ERROR_MAX_AGE_SECS}"
@@ -887,8 +910,11 @@ mod tests {
         let _ = GOOGLE_RECENT.set(Mutex::new(VecDeque::with_capacity(
             DEFAULT_GOOGLE_RATE_LIMIT,
         )));
-        let _ = SUCCESS_CACHE_CONTROL.set(format!(
-            "public, max-age={DEFAULT_SUCCESS_MAX_AGE_SECS}, s-maxage={DEFAULT_SUCCESS_MAX_AGE_SECS}"
+        let _ = SHEET_CACHE_CONTROL.set(format!(
+            "public, max-age={DEFAULT_SHEET_MAX_AGE_SECS}, s-maxage={DEFAULT_SHEET_MAX_AGE_SECS}"
+        ));
+        let _ = DOCUMENT_CACHE_CONTROL.set(format!(
+            "public, max-age={DEFAULT_DOCUMENT_MAX_AGE_SECS}, s-maxage={DEFAULT_DOCUMENT_MAX_AGE_SECS}"
         ));
         let _ = ERROR_CACHE_CONTROL.set(format!(
             "public, max-age={DEFAULT_ERROR_MAX_AGE_SECS}, s-maxage={DEFAULT_ERROR_MAX_AGE_SECS}"
@@ -965,6 +991,13 @@ mod tests {
         let uri: hyper::Uri = format!("/{spreadsheet_id}").parse().expect("uri");
         let response = route_request(&Method::GET, &uri).await;
         let status = response.status();
+        let cache_control = response
+            .headers()
+            .get(CACHE_CONTROL)
+            .expect("cache control")
+            .to_str()
+            .expect("cache control string")
+            .to_owned();
         let body = response
             .into_body()
             .collect()
@@ -973,6 +1006,12 @@ mod tests {
             .to_bytes();
 
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            cache_control,
+            format!(
+                "public, max-age={DEFAULT_DOCUMENT_MAX_AGE_SECS}, s-maxage={DEFAULT_DOCUMENT_MAX_AGE_SECS}"
+            )
+        );
         assert_eq!(
             body,
             Bytes::from_static(br#"{"Sheet One":[{"name":"alice"}],"Sheet Two":[{"name":"bob"}]}"#)
@@ -1008,6 +1047,13 @@ mod tests {
             .expect("uri");
         let response = route_request(&Method::GET, &uri).await;
         let status = response.status();
+        let cache_control = response
+            .headers()
+            .get(CACHE_CONTROL)
+            .expect("cache control")
+            .to_str()
+            .expect("cache control string")
+            .to_owned();
         let body = response
             .into_body()
             .collect()
@@ -1016,6 +1062,12 @@ mod tests {
             .to_bytes();
 
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            cache_control,
+            format!(
+                "public, max-age={DEFAULT_SHEET_MAX_AGE_SECS}, s-maxage={DEFAULT_SHEET_MAX_AGE_SECS}"
+            )
+        );
         assert_eq!(body, raw_body);
     }
 

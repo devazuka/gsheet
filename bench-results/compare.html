@@ -1,0 +1,753 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GSheet Bench Compare</title>
+  <style>
+    :root {
+      --bg: #2e3842;
+      --panel: #34404b;
+      --panel-2: #3e4347;
+      --ink: #d8dee9;
+      --muted: #a6acb9;
+      --line: #596878;
+      --raw: #99c794;
+      --shaped: #5c99d6;
+      --overhead: #f97b58;
+      --accent: #c695c6;
+      --warn: #f9ae58;
+      --danger: #ec5f66;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Iosevka", "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(92,153,214,.18), transparent 28rem),
+        radial-gradient(circle at top right, rgba(198,149,198,.16), transparent 26rem),
+        var(--bg);
+    }
+    main {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px 14px 32px;
+    }
+    h1, h2 { margin: 0 0 8px; }
+    h1 { font-size: 1.45rem; }
+    h2 { font-size: 1.05rem; }
+    p { color: var(--muted); line-height: 1.42; font-size: 0.92rem; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 14px;
+      margin-top: 14px;
+      box-shadow: 0 18px 36px rgba(0, 0, 0, 0.18);
+    }
+    .controls {
+      display: grid;
+      gap: 12px;
+    }
+    .run-list {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      margin-top: 8px;
+    }
+    .run-card {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px;
+      background: rgba(46, 56, 66, 0.72);
+      user-select: none;
+      transition: border-color 120ms ease, background-color 120ms ease, box-shadow 120ms ease;
+    }
+    .run-card.is-selected {
+      border-color: var(--accent);
+      background: rgba(60, 53, 78, 0.55);
+      box-shadow: 0 0 0 1px rgba(198, 149, 198, 0.18) inset;
+    }
+    .run-card label {
+      display: block;
+      cursor: pointer;
+    }
+    .run-card input {
+      display: none;
+    }
+    .run-meta {
+      font-size: 0.84rem;
+      color: var(--muted);
+      margin-top: 4px;
+    }
+    .chart {
+      display: grid;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .summary-grid {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      margin-top: 8px;
+    }
+    .summary-card {
+      background: rgba(46, 56, 66, 0.72);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px;
+    }
+    .summary-label {
+      color: var(--muted);
+      font-size: 0.78rem;
+      margin-bottom: 6px;
+    }
+    .summary-value {
+      font-size: 1.18rem;
+      line-height: 1;
+    }
+    .comparison-table-wrap {
+      overflow-x: auto;
+      margin-top: 8px;
+    }
+    .flamegraph-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .flamegraph-nav {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .nav-btn {
+      appearance: none;
+      border: 1px solid var(--line);
+      background: rgba(46, 56, 66, 0.72);
+      color: var(--ink);
+      border-radius: 10px;
+      padding: 6px 10px;
+      font: inherit;
+      cursor: pointer;
+    }
+    .nav-btn:disabled {
+      opacity: 0.45;
+      cursor: default;
+    }
+    .flamegraph-meta {
+      color: var(--muted);
+      font-size: 0.84rem;
+      margin-top: 6px;
+    }
+    .flamegraph-frame {
+      width: 100%;
+      height: 78vh;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fff;
+      margin-top: 10px;
+    }
+    .compare-panels {
+      display: grid;
+      gap: 14px;
+      margin-top: 12px;
+    }
+    .compare-panel {
+      background: rgba(46, 56, 66, 0.72);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+    }
+    .compare-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+    .compare-title {
+      font-size: 0.95rem;
+      margin: 0;
+    }
+    .compare-meta {
+      color: var(--muted);
+      font-size: 0.84rem;
+      line-height: 1.4;
+    }
+    .level-list {
+      display: grid;
+      gap: 10px;
+    }
+    .level-card {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px;
+      background: rgba(52, 64, 75, 0.8);
+    }
+    .level-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: baseline;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+    }
+    .level-title {
+      font-size: 0.88rem;
+    }
+    .level-meta {
+      color: var(--muted);
+      font-size: 0.8rem;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .plot-wrap {
+      margin-top: 8px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(52, 64, 75, 0.92);
+      padding: 8px;
+    }
+    .plot-wrap + .plot-wrap {
+      margin-top: 8px;
+    }
+    .plot {
+      width: 100%;
+      height: auto;
+      display: block;
+    }
+    .axis-label {
+      fill: var(--muted);
+      font-size: 12px;
+    }
+    .tick-label {
+      fill: var(--muted);
+      font-size: 11px;
+    }
+    .grid-line {
+      stroke: rgba(89, 104, 120, 0.45);
+      stroke-width: 1;
+    }
+    .axis-line {
+      stroke: var(--line);
+      stroke-width: 1.25;
+    }
+    .point {
+      stroke-width: 2;
+      fill: var(--panel);
+    }
+    .mini-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+      font-size: 0.82rem;
+    }
+    .mini-table th,
+    .mini-table td {
+      padding: 6px 8px;
+      border-top: 1px solid rgba(89, 104, 120, 0.35);
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+    .mini-table th:first-child,
+    .mini-table td:first-child {
+      text-align: left;
+    }
+    .mini-table .good {
+      color: var(--raw);
+    }
+    .mini-table .bad {
+      color: var(--danger);
+    }
+    .mini-table .neutral {
+      color: var(--muted);
+    }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 0.82rem;
+      margin-top: 6px;
+    }
+    .legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .swatch {
+      width: 14px;
+      height: 14px;
+      border-radius: 999px;
+      display: inline-block;
+    }
+    code {
+      font-family: inherit;
+      font-size: 0.88em;
+      background: rgba(89, 104, 120, 0.28);
+      padding: 2px 6px;
+      border-radius: 8px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>GSheet Bench Compare</h1>
+    <p>Pick one or more saved benchmark runs and compare raw vs shaped cost in grouped per-run panels.</p>
+
+    <section class="panel controls">
+      <div>
+        <strong>How to use it</strong>
+        <p>Serve the <code>bench-results</code> folder, then open this page. It reads <code>index.json</code> and the run files from the same directory.</p>
+      </div>
+      <div id="run-list" class="run-list"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Summary</h2>
+      <div class="legend">
+        <span><i class="swatch" style="background: var(--raw)"></i>Raw</span>
+        <span><i class="swatch" style="background: var(--shaped)"></i>Shaped</span>
+        <span><i class="swatch" style="background: var(--overhead)"></i>Overhead / ratio</span>
+      </div>
+      <div id="summary-grid" class="summary-grid"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Selected Run Matrix</h2>
+      <p>All selected runs are shown together here. The best value in each metric column is highlighted in green.</p>
+      <div id="comparison-table-wrap" class="comparison-table-wrap"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Per Run Breakdown</h2>
+      <div id="compare-panels" class="compare-panels"></div>
+    </section>
+
+    <section class="panel">
+      <div class="flamegraph-head">
+        <div>
+          <h2>Flamegraphs</h2>
+          <p>Left and right arrows switch between saved flamegraphs.</p>
+        </div>
+        <div class="flamegraph-nav">
+          <button id="flamegraph-prev" class="nav-btn" type="button">← prev</button>
+          <button id="flamegraph-next" class="nav-btn" type="button">next →</button>
+        </div>
+      </div>
+      <div id="flamegraph-meta" class="flamegraph-meta"></div>
+      <iframe id="flamegraph-frame" class="flamegraph-frame" title="Flamegraph viewer"></iframe>
+    </section>
+  </main>
+
+  <script type="module">
+    const runList = document.getElementById('run-list');
+    const summaryGrid = document.getElementById('summary-grid');
+    const comparisonTableWrap = document.getElementById('comparison-table-wrap');
+    const comparePanels = document.getElementById('compare-panels');
+    const flamegraphMeta = document.getElementById('flamegraph-meta');
+    const flamegraphFrame = document.getElementById('flamegraph-frame');
+    const flamegraphPrev = document.getElementById('flamegraph-prev');
+    const flamegraphNext = document.getElementById('flamegraph-next');
+
+    let runs = [];
+    let flamegraphs = [];
+    let flamegraphIndex = 0;
+
+    const colorFor = (type) => ({
+      raw: 'var(--raw)',
+      shaped: 'var(--shaped)',
+      overhead: 'var(--overhead)',
+    }[type] || 'var(--muted)');
+    const formatDate = (timestamp) => new Intl.DateTimeFormat(undefined, {
+      year: 'numeric',
+      month: 'short',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    }).format(new Date(Number(timestamp)));
+
+    function format(value, digits = 2) {
+      return Number(value).toFixed(digits);
+    }
+
+    function avgReq(run, key) {
+      const values = run.load_matrix.map((entry) => entry[key].req_per_sec);
+      return values.reduce((sum, value) => sum + value, 0) / Math.max(values.length, 1);
+    }
+
+    function avgRatio(run) {
+      const values = run.load_matrix.map((entry) => entry.overhead.req_per_sec_ratio);
+      return values.reduce((sum, value) => sum + value, 0) / Math.max(values.length, 1);
+    }
+
+    function selectedRuns() {
+      const checked = [...runList.querySelectorAll('input[type="checkbox"]:checked')].map((input) => input.value);
+      return runs.filter((run) => checked.includes(run.file));
+    }
+
+    function renderRunList() {
+      runList.innerHTML = '';
+      for (const run of runs) {
+        const card = document.createElement('div');
+        card.className = 'run-card';
+        card.innerHTML = `
+          <label>
+            <input type="checkbox" value="${run.file}" checked>
+            <div>
+              <strong>${run.sheet_name}</strong>
+              <div class="run-meta">${formatDate(run.timestamp)}</div>
+              <div class="run-meta">overhead ${format(run.single_request.overhead_ms, 3)} ms • peak RSS ${format(run.peak_rss_mb, 2)} MB</div>
+            </div>
+          </label>
+        `;
+        const input = card.querySelector('input');
+        const syncSelected = () => {
+          card.classList.toggle('is-selected', input.checked);
+        };
+        input.addEventListener('change', () => {
+          syncSelected();
+          renderCharts();
+        });
+        syncSelected();
+        runList.appendChild(card);
+      }
+    }
+
+    function renderSummary(selected) {
+      summaryGrid.innerHTML = '';
+      if (!selected.length) {
+        summaryGrid.innerHTML = '<p>No data selected.</p>';
+        return;
+      }
+
+      const avgOverhead = selected.reduce((sum, run) => sum + run.single_request.overhead_ms, 0) / selected.length;
+      const avgRss = selected.reduce((sum, run) => sum + run.peak_rss_mb, 0) / selected.length;
+      const avgEndRss = selected.reduce((sum, run) => sum + (run.rss_end_mb ?? run.peak_rss_mb), 0) / selected.length;
+      const ratios = selected.flatMap((run) => run.load_matrix.map((entry) => entry.overhead.req_per_sec_ratio));
+      const avgRatio = ratios.reduce((sum, value) => sum + value, 0) / Math.max(ratios.length, 1);
+
+      const cards = [
+        { label: 'Selected runs', value: selected.length, suffix: '' },
+        { label: 'Avg single req overhead', value: format(avgOverhead, 3), suffix: ' ms' },
+        { label: 'Avg shaped/raw req/s ratio', value: format(avgRatio, 4), suffix: '' },
+        { label: 'Avg peak RSS', value: format(avgRss, 2), suffix: ' MB' },
+        { label: 'Avg end RSS', value: format(avgEndRss, 2), suffix: ' MB' },
+      ];
+
+      for (const card of cards) {
+        const element = document.createElement('div');
+        element.className = 'summary-card';
+        element.innerHTML = `
+          <div class="summary-label">${card.label}</div>
+          <div class="summary-value">${card.value}${card.suffix}</div>
+        `;
+        summaryGrid.appendChild(element);
+      }
+    }
+
+    function renderComparisonTable(selected) {
+      comparisonTableWrap.innerHTML = '';
+      if (!selected.length) {
+        comparisonTableWrap.innerHTML = '<p>No data selected.</p>';
+        return;
+      }
+
+      const best = {
+        overhead: Math.min(...selected.map((run) => run.single_request.overhead_ms)),
+        peakRss: Math.min(...selected.map((run) => run.peak_rss_mb)),
+        avgRss: Math.min(...selected.map((run) => run.avg_rss_mb ?? run.peak_rss_mb)),
+        shapedReq: Math.max(...selected.map((run) => avgReq(run, 'shaped'))),
+        rawReq: Math.max(...selected.map((run) => avgReq(run, 'raw'))),
+        ratio: Math.max(...selected.map((run) => avgRatio(run))),
+      };
+
+      const isBest = (value, target) => Math.abs(value - target) < 0.0001;
+
+      const body = selected.map((run) => {
+        const overhead = run.single_request.overhead_ms;
+        const peakRss = run.peak_rss_mb;
+        const avgRss = run.avg_rss_mb ?? run.peak_rss_mb;
+        const shapedReq = avgReq(run, 'shaped');
+        const rawReq = avgReq(run, 'raw');
+        const ratio = avgRatio(run);
+        return `
+        <tr>
+          <td>${run.sheet_name}<br><span class="run-meta">${formatDate(run.timestamp)}</span></td>
+          <td class="${isBest(overhead, best.overhead) ? 'good' : 'neutral'}">${format(overhead, 3)} ms</td>
+          <td class="${isBest(peakRss, best.peakRss) ? 'good' : 'neutral'}">${format(peakRss, 2)} MB</td>
+          <td class="${isBest(avgRss, best.avgRss) ? 'good' : 'neutral'}">${format(avgRss, 2)} MB</td>
+          <td class="${isBest(shapedReq, best.shapedReq) ? 'good' : 'neutral'}">${format(shapedReq, 2)}</td>
+          <td class="${isBest(rawReq, best.rawReq) ? 'good' : 'neutral'}">${format(rawReq, 2)}</td>
+          <td class="${isBest(ratio, best.ratio) ? 'good' : 'neutral'}">${format(ratio, 4)}</td>
+        </tr>
+      `;
+      }).join('');
+
+      comparisonTableWrap.innerHTML = `
+        <table class="mini-table">
+          <thead>
+            <tr>
+              <th>run</th>
+              <th>overhead</th>
+              <th>peak rss</th>
+              <th>avg rss</th>
+              <th>avg shaped req/s</th>
+              <th>avg raw req/s</th>
+              <th>avg shaped/raw ratio</th>
+            </tr>
+          </thead>
+          <tbody>${body}</tbody>
+        </table>
+      `;
+    }
+
+    function renderComparePanels(selected) {
+      comparePanels.innerHTML = '';
+      if (!selected.length) {
+        comparePanels.innerHTML = '<p>No data selected.</p>';
+        return;
+      }
+
+      for (const run of selected) {
+        const panel = document.createElement('article');
+        panel.className = 'compare-panel';
+
+        const points = run.load_matrix;
+        const maxReq = Math.max(...points.flatMap((entry) => [entry.raw.req_per_sec, entry.shaped.req_per_sec]), 1);
+        const minConcurrency = Math.min(...points.map((entry) => entry.concurrency));
+        const maxConcurrency = Math.max(...points.map((entry) => entry.concurrency));
+        const width = 760;
+        const height = 260;
+        const padding = { top: 20, right: 18, bottom: 40, left: 56 };
+        const innerWidth = width - padding.left - padding.right;
+        const innerHeight = height - padding.top - padding.bottom;
+        const x = (value) => padding.left + (
+          maxConcurrency === minConcurrency
+            ? innerWidth / 2
+            : ((value - minConcurrency) / (maxConcurrency - minConcurrency)) * innerWidth
+        );
+        const y = (value) => padding.top + innerHeight - ((value / maxReq) * innerHeight);
+        const rawPath = points.map((entry, index) => `${index === 0 ? 'M' : 'L'} ${x(entry.concurrency)} ${y(entry.raw.req_per_sec)}`).join(' ');
+        const shapedPath = points.map((entry, index) => `${index === 0 ? 'M' : 'L'} ${x(entry.concurrency)} ${y(entry.shaped.req_per_sec)}`).join(' ');
+        const gridLines = [0, 0.25, 0.5, 0.75, 1].map((step) => {
+          const value = maxReq * step;
+          const yPos = y(value);
+          return `
+            <line class="grid-line" x1="${padding.left}" y1="${yPos}" x2="${width - padding.right}" y2="${yPos}"></line>
+            <text class="tick-label" x="${padding.left - 10}" y="${yPos + 4}" text-anchor="end">${format(value, 0)}</text>
+          `;
+        }).join('');
+        const xTicks = points.map((entry) => `
+          <text class="tick-label" x="${x(entry.concurrency)}" y="${height - 10}" text-anchor="middle">${entry.concurrency}</text>
+        `).join('');
+        const rawPoints = points.map((entry) => `
+          <circle class="point" cx="${x(entry.concurrency)}" cy="${y(entry.raw.req_per_sec)}" r="4" stroke="${colorFor('raw')}"></circle>
+        `).join('');
+        const shapedPoints = points.map((entry) => `
+          <circle class="point" cx="${x(entry.concurrency)}" cy="${y(entry.shaped.req_per_sec)}" r="4" stroke="${colorFor('shaped')}"></circle>
+        `).join('');
+        const rowsHtml = points.map((entry) => `
+          <tr>
+            <td>${entry.concurrency}</td>
+            <td>${format(entry.raw.req_per_sec, 2)}</td>
+            <td>${format(entry.shaped.req_per_sec, 2)}</td>
+            <td>${format(entry.overhead.req_per_sec_delta, 2)}</td>
+            <td>${format(entry.overhead.req_per_sec_ratio, 4)}</td>
+          </tr>
+        `).join('');
+        const rssSamples = run.rss_samples || [];
+        const maxRss = Math.max(...rssSamples.map((entry) => entry.rss_mb), run.peak_rss_mb || 1, 1);
+        const maxT = Math.max(...rssSamples.map((entry) => entry.t_ms), 1);
+        const rssWidth = 760;
+        const rssHeight = 220;
+        const rssPadding = { top: 20, right: 18, bottom: 40, left: 56 };
+        const rssInnerWidth = rssWidth - rssPadding.left - rssPadding.right;
+        const rssInnerHeight = rssHeight - rssPadding.top - rssPadding.bottom;
+        const rx = (value) => rssPadding.left + ((value / maxT) * rssInnerWidth);
+        const ry = (value) => rssPadding.top + rssInnerHeight - ((value / maxRss) * rssInnerHeight);
+        const rssPath = rssSamples.map((entry, index) => `${index === 0 ? 'M' : 'L'} ${rx(entry.t_ms)} ${ry(entry.rss_mb)}`).join(' ');
+        const rssGridLines = [0, 0.25, 0.5, 0.75, 1].map((step) => {
+          const value = maxRss * step;
+          const yPos = ry(value);
+          return `
+            <line class="grid-line" x1="${rssPadding.left}" y1="${yPos}" x2="${rssWidth - rssPadding.right}" y2="${yPos}"></line>
+            <text class="tick-label" x="${rssPadding.left - 10}" y="${yPos + 4}" text-anchor="end">${format(value, 1)}</text>
+          `;
+        }).join('');
+        const rssXTicks = [0, 0.25, 0.5, 0.75, 1].map((step) => {
+          const value = maxT * step;
+          return `<text class="tick-label" x="${rx(value)}" y="${rssHeight - 10}" text-anchor="middle">${format(value / 1000, 1)}s</text>`;
+        }).join('');
+
+        panel.innerHTML = `
+          <div class="compare-head">
+            <div>
+              <h3 class="compare-title">${run.sheet_name}</h3>
+              <div class="compare-meta">${formatDate(run.timestamp)}</div>
+            </div>
+            <div class="compare-meta">
+              <div>single req overhead ${format(run.single_request.overhead_ms, 3)} ms</div>
+              <div>peak RSS ${format(run.peak_rss_mb, 2)} MB</div>
+              <div>avg RSS ${format(run.avg_rss_mb ?? run.peak_rss_mb, 2)} MB</div>
+              <div>requests/level ${run.requests_per_level}</div>
+            </div>
+          </div>
+          <div class="level-card">
+            <div class="level-top">
+              <div class="level-title">req/s by concurrency</div>
+              <div class="level-meta">
+                <span>raw ${format(run.single_request.raw.mean_ms, 3)} ms</span>
+                <span>shaped ${format(run.single_request.shaped.mean_ms, 3)} ms</span>
+              </div>
+            </div>
+            <div class="plot-wrap">
+              <svg class="plot" viewBox="0 0 ${width} ${height}" aria-label="Concurrency versus requests per second plot">
+                ${gridLines}
+                <line class="axis-line" x1="${padding.left}" y1="${padding.top}" x2="${padding.left}" y2="${height - padding.bottom}"></line>
+                <line class="axis-line" x1="${padding.left}" y1="${height - padding.bottom}" x2="${width - padding.right}" y2="${height - padding.bottom}"></line>
+                <path d="${rawPath}" fill="none" stroke="${colorFor('raw')}" stroke-width="3"></path>
+                <path d="${shapedPath}" fill="none" stroke="${colorFor('shaped')}" stroke-width="3"></path>
+                ${rawPoints}
+                ${shapedPoints}
+                ${xTicks}
+                <text class="axis-label" x="${width / 2}" y="${height}" text-anchor="middle">concurrency</text>
+                <text class="axis-label" x="16" y="${height / 2}" text-anchor="middle" transform="rotate(-90 16 ${height / 2})">req/s</text>
+              </svg>
+            </div>
+            <table class="mini-table">
+              <thead>
+                <tr>
+                  <th>c</th>
+                  <th>raw</th>
+                  <th>shaped</th>
+                  <th>delta</th>
+                  <th>ratio</th>
+                </tr>
+              </thead>
+              <tbody>${rowsHtml}</tbody>
+            </table>
+            <div class="plot-wrap">
+              <svg class="plot" viewBox="0 0 ${rssWidth} ${rssHeight}" aria-label="Memory usage over time plot">
+                ${rssGridLines}
+                <line class="axis-line" x1="${rssPadding.left}" y1="${rssPadding.top}" x2="${rssPadding.left}" y2="${rssHeight - rssPadding.bottom}"></line>
+                <line class="axis-line" x1="${rssPadding.left}" y1="${rssHeight - rssPadding.bottom}" x2="${rssWidth - rssPadding.right}" y2="${rssHeight - rssPadding.bottom}"></line>
+                <path d="${rssPath}" fill="none" stroke="var(--warn)" stroke-width="3"></path>
+                ${rssXTicks}
+                <text class="axis-label" x="${rssWidth / 2}" y="${rssHeight}" text-anchor="middle">time</text>
+                <text class="axis-label" x="16" y="${rssHeight / 2}" text-anchor="middle" transform="rotate(-90 16 ${rssHeight / 2})">rss mb</text>
+              </svg>
+            </div>
+            <table class="mini-table">
+              <thead>
+                <tr>
+                  <th>rss start</th>
+                  <th>rss avg</th>
+                  <th>rss peak</th>
+                  <th>rss end</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>${format(run.rss_start_mb ?? 0, 2)} MB</td>
+                  <td>${format(run.avg_rss_mb ?? run.peak_rss_mb, 2)} MB</td>
+                  <td>${format(run.peak_rss_mb, 2)} MB</td>
+                  <td>${format(run.rss_end_mb ?? run.peak_rss_mb, 2)} MB</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        `;
+
+        comparePanels.appendChild(panel);
+      }
+    }
+
+    function renderCharts() {
+      const selected = selectedRuns();
+      renderSummary(selected);
+      renderComparisonTable(selected);
+      renderComparePanels(selected);
+    }
+
+    function renderFlamegraph() {
+      if (!flamegraphs.length) {
+        flamegraphMeta.textContent = 'No flamegraphs found in bench-results/flamegraphs.';
+        flamegraphFrame.removeAttribute('src');
+        flamegraphPrev.disabled = true;
+        flamegraphNext.disabled = true;
+        return;
+      }
+
+      const entry = flamegraphs[flamegraphIndex];
+      flamegraphMeta.innerHTML = `
+        <strong>${entry.mode || 'unknown'}</strong> •
+        ${entry.sheet_name || 'unknown sheet'} •
+        ${formatDate(entry.timestamp)} •
+        ${flamegraphIndex + 1}/${flamegraphs.length}
+      `;
+      flamegraphFrame.src = `./flamegraphs/${entry.file}`;
+      flamegraphPrev.disabled = flamegraphIndex === 0;
+      flamegraphNext.disabled = flamegraphIndex === flamegraphs.length - 1;
+    }
+
+    flamegraphPrev.addEventListener('click', () => {
+      if (flamegraphIndex > 0) {
+        flamegraphIndex -= 1;
+        renderFlamegraph();
+      }
+    });
+
+    flamegraphNext.addEventListener('click', () => {
+      if (flamegraphIndex < flamegraphs.length - 1) {
+        flamegraphIndex += 1;
+        renderFlamegraph();
+      }
+    });
+
+    window.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowLeft' && flamegraphIndex > 0) {
+        flamegraphIndex -= 1;
+        renderFlamegraph();
+      } else if (event.key === 'ArrowRight' && flamegraphIndex < flamegraphs.length - 1) {
+        flamegraphIndex += 1;
+        renderFlamegraph();
+      }
+    });
+
+    try {
+      const manifest = await fetch('./index.json').then((response) => {
+        if (!response.ok) throw new Error('index.json not found');
+        return response.json();
+      });
+      const loaded = await Promise.all(
+        manifest.map((entry) => fetch(`./${entry.file}`).then((response) => response.json()))
+      );
+      runs = loaded.sort((a, b) => Number(b.timestamp) - Number(a.timestamp));
+    } catch (_) {
+      runs = [];
+    }
+
+    try {
+      const manifest = await fetch('./flamegraphs/index.json').then((response) => {
+        if (!response.ok) throw new Error('flamegraphs/index.json not found');
+        return response.json();
+      });
+      flamegraphs = manifest.sort((a, b) => Number(b.timestamp) - Number(a.timestamp));
+    } catch (_) {
+      flamegraphs = [];
+    }
+    renderRunList();
+    renderCharts();
+    renderFlamegraph();
+
+  </script>
+</body>
+</html>

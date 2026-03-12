@@ -91,3 +91,75 @@ docker compose up --build -d
 - `GET /:id/:sheet`
 - `GET /raw/:id`
 - `GET /raw/:id/:sheet`
+
+## Benchmarks
+
+[`scripts/bench.sh`](/home/cdenis/Documents/gsheet/scripts/bench.sh) measures the cost of turning a cached raw Google sheet response into the shaped JSON response.
+
+It benchmarks the same sheet through:
+
+- `/raw/:id/:sheet`
+- `/:id/:sheet`
+
+and reports the delta.
+
+It uses:
+
+- `hyperfine` for repeated single-request timing
+- parallel `curl` for simple throughput/load
+This repo includes a small benchmark flow focused on the thing that matters here: raw cached Google JSON vs shaped JSON.
+
+Install:
+
+```sh
+sudo apt install hyperfine jq curl python3
+```
+
+Run:
+
+```sh
+bash scripts/bench.sh
+```
+
+It uses `.env`, starts `target/release/gsheet`, hits the sheet from `TEST_SHEET_ID` and `TEST_SHEET_NAME`, saves JSON results in `bench-results/`, then opens a small viewer.
+
+If needed:
+
+```sh
+bash scripts/bench.sh "Sheet 1"
+bash scripts/bench.sh "Sheet 1" 500 1,8,32,128,256
+```
+
+The viewer compares saved runs and shows:
+
+- raw vs shaped throughput by concurrency
+- single-request overhead
+- RSS over time
+- a small comparison matrix across selected runs
+
+## Flamegraphs
+
+For function-level profiling:
+
+```sh
+cargo install flamegraph
+```
+
+Use it with release debuginfo:
+
+```sh
+CARGO_PROFILE_RELEASE_DEBUG=true cargo flamegraph --bin gsheet -- --help
+```
+
+Or use the helper:
+
+```sh
+bash scripts/flamegraph.sh
+```
+
+Examples:
+
+```sh
+bash scripts/flamegraph.sh shaped "Sheet 1" 20 64 1000
+bash scripts/flamegraph.sh raw "Sheet 1" 20 64 1000
+```

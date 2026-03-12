@@ -6,18 +6,18 @@ This document extracts the behavior implemented in [`base.ts`](/home/cdenis/Docu
 
 ### 1. Spreadsheet metadata lookup
 
-Used only when the `:sheet` path segment is numeric and must be translated from a 1-based sheet number to a sheet title.
+Used when the request targets the whole document and the service must enumerate sheet titles.
 
 - Method: `GET`
 - URL: `https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}?key={GOOGLE_API_KEY}`
 - Purpose:
   - validate spreadsheet access
-  - map sheet number `1..n` to `sheets[index].properties.title`
-  - return a user-facing error when the sheet number is invalid
+  - list sheet titles
+  - drive whole-document responses
 
 ### 2. Sheet values lookup
 
-Used for every successful data request after the sheet title is known.
+Used for every successful sheet data request once the sheet title is known.
 
 - Method: `GET`
 - URL: `https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{sheet_title_encoded}?key={GOOGLE_API_KEY}`
@@ -34,8 +34,15 @@ Used for every successful data request after the sheet title is known.
   - redirects to the GitHub README
 - `GET /up`
   - returns plain text `ok`
+- `GET /:id`
+  - returns all sheets keyed by sheet title
 - `GET /:id/:sheet`
   - returns sheet data as JSON array of objects
+- `GET /raw/:id`
+  - returns all raw Google values payloads keyed by sheet title
+- `GET /raw/:id/:sheet`
+  - returns one raw Google values payload
+- trailing `/` characters are ignored on all routes
 - all other paths
   - return a JSON error with status `404`
 
@@ -48,17 +55,16 @@ Used for every successful data request after the sheet title is known.
 
 - `:sheet` is URL-decoded
 - `+` is treated as a space before decoding
-- non-numeric values are used as sheet titles directly
-- numeric values are treated as 1-based sheet indexes
-- sheet `0` is rejected with `For this API, sheet numbers start at 1`
-- missing numeric sheet indexes return `There is no sheet number {n}`
+- the decoded value is used directly as the sheet title
+- numeric sheet indexes are not supported
 
 ### Response shaping
 
 - Google `values[0]` becomes the header row
 - each subsequent row becomes an object keyed by the header names
 - missing trailing cells are omitted
-- response body is a JSON array
+- `GET /:id/:sheet` returns a JSON array
+- `GET /:id` returns a JSON object keyed by sheet title
 
 ### Headers and caching
 
@@ -70,6 +76,15 @@ Used for every successful data request after the sheet title is known.
   - `Cache-Control: public, max-age=60, s-maxage=60`
 - error responses include:
   - `Cache-Control: public, max-age=30, s-maxage=30`
+- upstream Google cache entries start at `300` seconds
+- upstream Google cache entries can extend up to `1200` seconds when the Google request queue is under pressure
+
+### Upstream throttling
+
+- Google API calls are limited to `300` requests per `60` seconds
+- the limiter is applied only to cache misses that actually call Google
+- at most `64` Google requests may wait in the local throttle queue
+- if that queue is full, the request fails with `429`
 
 ### Error shape
 
@@ -92,9 +107,9 @@ All handled errors return:
 ## Current Rust implementation
 
 - lightweight HTTP server using `hyper`
-- route surface: `/`, `/up`, `/:id/:sheet`, fallback `404`
+- route surface: `/`, `/up`, `/:id`, `/:id/:sheet`, `/raw/:id`, `/raw/:id/:sheet`, fallback `404`
 - reject all query parameters
-- numeric sheet resolution via spreadsheet metadata lookup
+- whole-document metadata lookup
 - sheet values lookup
 - row-to-object JSON transformation
 - CORS and fixed cache headers
@@ -102,8 +117,10 @@ All handled errors return:
 - `heed` cache for raw Google metadata payloads
 - `heed` cache for raw Google values payloads
 - in-process dedupe for in-flight upstream Google fetches
+- upstream Google throttle with bounded queue and `429` overflow
 
 Notes:
 - the Rust service caches raw Google responses and shapes them after cache retrieval
 - expired `heed` entries are deleted on read instead of accumulating indefinitely
+- trailing `/` characters are normalized away during routing
 - analytics is still not implemented

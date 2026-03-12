@@ -1,12 +1,12 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     convert::Infallible,
     env, fs,
     future::Future,
     net::SocketAddr,
     path::Path,
     sync::{Arc, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
@@ -32,13 +32,22 @@ use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tokio::sync::{Mutex, Notify};
+use tokio::{
+    sync::{Mutex, Notify, Semaphore},
+    time::{Instant, sleep},
+};
 
-const README_URL: &str = "https://github.com/benborgers/opensheet#readme";
+const README_URL: &str = "https://github.com/kigiri/gsheet#readme";
 const BASE_ALLOWED_HEADERS: &str = "Origin, X-Requested-With, Content-Type, Accept";
 const SUCCESS_CACHE_CONTROL: &str = "public, max-age=60, s-maxage=60";
 const ERROR_CACHE_CONTROL: &str = "public, max-age=30, s-maxage=30";
+const ROUTE_FORMAT: &str =
+    "URL format is /spreadsheet_id[/sheet_name] or /raw/spreadsheet_id[/sheet_name]";
 const GOOGLE_CACHE_TTL_SECS: u64 = 300;
+const GOOGLE_CACHE_TTL_MAX_SECS: u64 = 1200;
+const GOOGLE_RATE_LIMIT: usize = 300;
+const GOOGLE_RATE_WINDOW: Duration = Duration::from_secs(60);
+const GOOGLE_MAX_QUEUED_REQUESTS: usize = 64;
 const CACHE_DB: &str = "cache";
 const EXPIRY_DB: &str = "expiry";
 
@@ -55,6 +64,7 @@ struct State {
     api_key: String,
     cache: HeedCache,
     inflight: InflightRequests,
+    throttle: GoogleThrottle,
 }
 
 #[tokio::main]
@@ -77,6 +87,11 @@ async fn main() {
         cache: HeedCache::open(env::var("CACHE_DIR").unwrap_or_else(|_| "./data/heed".to_string()))
             .expect("failed to initialize cache"),
         inflight: InflightRequests::new(),
+        throttle: GoogleThrottle::new(
+            GOOGLE_RATE_LIMIT,
+            GOOGLE_RATE_WINDOW,
+            GOOGLE_MAX_QUEUED_REQUESTS,
+        ),
     };
     let _ = STATE.set(state);
 
@@ -109,13 +124,12 @@ fn state() -> &'static State {
 
 async fn route_request(method: &Method, uri: &hyper::Uri) -> Response<ResBody> {
     if method != Method::GET {
-        return error_response(
-            "URL format is /spreadsheet_id/sheet_name".to_owned(),
-            StatusCode::NOT_FOUND,
-        );
+        return error_response(ROUTE_FORMAT.to_owned(), StatusCode::NOT_FOUND);
     }
 
-    if uri.path() == "/" {
+    let path = uri.path().trim_matches('/');
+
+    if path.is_empty() {
         let mut response = Response::new(Full::new(Bytes::new()));
         *response.status_mut() = StatusCode::FOUND;
         response
@@ -124,7 +138,7 @@ async fn route_request(method: &Method, uri: &hyper::Uri) -> Response<ResBody> {
         return response;
     }
 
-    if uri.path() == "/up" {
+    if path == "up" {
         let mut response = Response::new(Full::new(Bytes::from_static(b"ok")));
         *response.status_mut() = StatusCode::OK;
         return response;
@@ -137,30 +151,48 @@ async fn route_request(method: &Method, uri: &hyper::Uri) -> Response<ResBody> {
         );
     }
 
-    let path = uri.path().trim_start_matches('/');
-    let Some((id, sheet)) = path.split_once('/') else {
-        return error_response(
-            "URL format is /spreadsheet_id/sheet_name".to_owned(),
-            StatusCode::NOT_FOUND,
-        );
+    let mut path = path;
+    let raw = if let Some(raw_path) = path.strip_prefix("raw/") {
+        path = raw_path;
+        true
+    } else {
+        false
     };
+    let mut parts = path.split('/');
+    let Some(id) = parts.next() else {
+        return error_response(ROUTE_FORMAT.to_owned(), StatusCode::NOT_FOUND);
+    };
+    let sheet = parts.next();
 
-    if id.is_empty() || sheet.is_empty() || sheet.contains('/') {
-        return error_response(
-            "URL format is /spreadsheet_id/sheet_name".to_owned(),
-            StatusCode::NOT_FOUND,
-        );
+    if id.is_empty() || sheet.is_some_and(str::is_empty) || parts.next().is_some() {
+        return error_response(ROUTE_FORMAT.to_owned(), StatusCode::NOT_FOUND);
     }
 
-    match fetch_sheet_json(id, sheet).await {
-        Ok(body) => json_bytes_response(StatusCode::OK, SUCCESS_CACHE_CONTROL, body),
+    let result = if let Some(sheet) = sheet {
+        let sheet_name = match decode_sheet_name(sheet) {
+            Ok(sheet_name) => sheet_name,
+            Err(error) => return error_response(error.message, error.status),
+        };
+
+        if raw {
+            fetch_values_bytes(id, &sheet_name).await
+        } else {
+            fetch_sheet_json(id, &sheet_name).await.map(Bytes::from)
+        }
+    } else if raw {
+        fetch_document_raw_json(id).await
+    } else {
+        fetch_document_json(id).await.map(Bytes::from)
+    };
+
+    match result {
+        Ok(body) => json_response(StatusCode::OK, SUCCESS_CACHE_CONTROL, body),
         Err(error) => error_response(error.message, error.status),
     }
 }
 
-async fn fetch_sheet_json(spreadsheet_id: &str, sheet_param: &str) -> Result<Vec<u8>, GoogleError> {
-    let sheet_name = resolve_sheet_name(spreadsheet_id, sheet_param).await?;
-    let body = fetch_values_bytes(spreadsheet_id, &sheet_name).await?;
+async fn fetch_sheet_json(spreadsheet_id: &str, sheet_name: &str) -> Result<Vec<u8>, GoogleError> {
+    let body = fetch_values_bytes(spreadsheet_id, sheet_name).await?;
     let payload: SheetValuesResponse =
         serde_json::from_slice(&body).map_err(GoogleError::json_decode)?;
 
@@ -172,10 +204,44 @@ async fn fetch_sheet_json(spreadsheet_id: &str, sheet_param: &str) -> Result<Vec
     serde_json::to_vec(&rows).map_err(GoogleError::json_encode)
 }
 
-async fn resolve_sheet_name(
-    spreadsheet_id: &str,
-    sheet_param: &str,
-) -> Result<String, GoogleError> {
+async fn fetch_document_json(spreadsheet_id: &str) -> Result<Vec<u8>, GoogleError> {
+    let metadata = fetch_spreadsheet_metadata(spreadsheet_id).await?;
+    let mut document = Map::with_capacity(metadata.sheets.len());
+
+    for sheet in metadata.sheets {
+        let body = fetch_values_bytes(spreadsheet_id, &sheet.properties.title).await?;
+        let payload: SheetValuesResponse =
+            serde_json::from_slice(&body).map_err(GoogleError::json_decode)?;
+
+        if let Some(error) = payload.error {
+            return Err(GoogleError::bad_request(error.message));
+        }
+
+        document.insert(
+            sheet.properties.title,
+            Value::Array(values_to_rows(payload.values.unwrap_or_default())),
+        );
+    }
+
+    serde_json::to_vec(&document).map_err(GoogleError::json_encode)
+}
+
+async fn fetch_document_raw_json(spreadsheet_id: &str) -> Result<Bytes, GoogleError> {
+    let metadata = fetch_spreadsheet_metadata(spreadsheet_id).await?;
+    let mut document = Map::with_capacity(metadata.sheets.len());
+
+    for sheet in metadata.sheets {
+        let body = fetch_values_bytes(spreadsheet_id, &sheet.properties.title).await?;
+        let payload: Value = serde_json::from_slice(&body).map_err(GoogleError::json_decode)?;
+        document.insert(sheet.properties.title, payload);
+    }
+
+    serde_json::to_vec(&document)
+        .map(Bytes::from)
+        .map_err(GoogleError::json_encode)
+}
+
+fn decode_sheet_name(sheet_param: &str) -> Result<String, GoogleError> {
     let normalized = if sheet_param.contains('+') {
         sheet_param.replace('+', " ")
     } else {
@@ -184,22 +250,6 @@ async fn resolve_sheet_name(
     let decoded = urlencoding::decode(&normalized)
         .map(|decoded| decoded.into_owned())
         .map_err(|_| GoogleError::bad_request("Invalid sheet path encoding"))?;
-
-    if let Ok(sheet_number) = decoded.parse::<usize>() {
-        if sheet_number == 0 {
-            return Err(GoogleError::bad_request(
-                "For this API, sheet numbers start at 1",
-            ));
-        }
-
-        let metadata = fetch_spreadsheet_metadata(spreadsheet_id).await?;
-        let index = sheet_number - 1;
-        let sheet = metadata.sheets.get(index).ok_or_else(|| {
-            GoogleError::bad_request(format!("There is no sheet number {decoded}"))
-        })?;
-
-        return Ok(sheet.properties.title.clone());
-    }
 
     Ok(decoded)
 }
@@ -241,9 +291,10 @@ async fn fetch_spreadsheet_metadata(
                     "Google Sheets metadata request failed",
                 ));
             }
+            let ttl_seconds = state().throttle.cache_ttl_secs();
             state()
                 .cache
-                .put_metadata(&cache_key, &body, GOOGLE_CACHE_TTL_SECS)
+                .put_metadata(&cache_key, &body, ttl_seconds)
                 .map_err(GoogleError::cache)?;
             Ok(body)
         })
@@ -289,9 +340,10 @@ async fn fetch_values_bytes(spreadsheet_id: &str, sheet_name: &str) -> Result<By
             if status != StatusCode::OK {
                 return Err(GoogleError::bad_request("Google Sheets request failed"));
             }
+            let ttl_seconds = state().throttle.cache_ttl_secs();
             state()
                 .cache
-                .put_values(&cache_key, &body, GOOGLE_CACHE_TTL_SECS)
+                .put_values(&cache_key, &body, ttl_seconds)
                 .map_err(GoogleError::cache)?;
             Ok(body)
         })
@@ -299,6 +351,8 @@ async fn fetch_values_bytes(spreadsheet_id: &str, sheet_name: &str) -> Result<By
 }
 
 async fn fetch_json(url: &str) -> Result<(StatusCode, Bytes), GoogleError> {
+    state().throttle.acquire().await?;
+
     let request = Request::builder()
         .method(Method::GET)
         .uri(url)
@@ -320,6 +374,73 @@ async fn fetch_json(url: &str) -> Result<(StatusCode, Bytes), GoogleError> {
         .to_bytes();
 
     Ok((status, body))
+}
+
+struct GoogleThrottle {
+    limit: usize,
+    window: Duration,
+    queue: Semaphore,
+    recent: Mutex<VecDeque<Instant>>,
+}
+
+impl GoogleThrottle {
+    fn new(limit: usize, window: Duration, max_queued: usize) -> Self {
+        Self {
+            limit,
+            window,
+            queue: Semaphore::new(max_queued),
+            recent: Mutex::new(VecDeque::with_capacity(limit)),
+        }
+    }
+
+    async fn acquire(&self) -> Result<(), GoogleError> {
+        let queue_permit = self
+            .queue
+            .try_acquire()
+            .map_err(|_| GoogleError::too_many_requests("Too many Google requests queued"))?;
+
+        loop {
+            let wait_for = {
+                let mut recent = self.recent.lock().await;
+                let now = Instant::now();
+                while recent
+                    .front()
+                    .is_some_and(|instant| now.duration_since(*instant) >= self.window)
+                {
+                    recent.pop_front();
+                }
+
+                if recent.len() < self.limit {
+                    recent.push_back(now);
+                    None
+                } else {
+                    Some(self.window - now.duration_since(*recent.front().expect("recent entry")))
+                }
+            };
+
+            if let Some(wait_for) = wait_for {
+                sleep(wait_for).await;
+            } else {
+                drop(queue_permit);
+                return Ok(());
+            }
+        }
+    }
+
+    fn cache_ttl_secs(&self) -> u64 {
+        let queued = GOOGLE_MAX_QUEUED_REQUESTS.saturating_sub(self.queue.available_permits());
+        let multiplier = if queued >= 48 {
+            4
+        } else if queued >= 24 {
+            3
+        } else if queued >= 8 {
+            2
+        } else {
+            1
+        };
+
+        (GOOGLE_CACHE_TTL_SECS * multiplier).min(GOOGLE_CACHE_TTL_MAX_SECS)
+    }
 }
 
 #[derive(Clone)]
@@ -504,15 +625,15 @@ fn error_response(message: String, status: StatusCode) -> Response<ResBody> {
     })
     .expect("failed to serialize error response");
 
-    json_bytes_response(status, ERROR_CACHE_CONTROL, body)
+    json_response(status, ERROR_CACHE_CONTROL, body)
 }
 
-fn json_bytes_response(
+fn json_response(
     status: StatusCode,
     cache_control: &'static str,
-    body: Vec<u8>,
+    body: impl Into<Bytes>,
 ) -> Response<ResBody> {
-    let mut response = Response::new(Full::new(Bytes::from(body)));
+    let mut response = Response::new(Full::new(body.into()));
     *response.status_mut() = status;
 
     let headers = response.headers_mut();
@@ -638,6 +759,13 @@ impl GoogleError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
+
+    fn too_many_requests(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            status: StatusCode::TOO_MANY_REQUESTS,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -705,6 +833,11 @@ mod tests {
             api_key: "test-key".to_string(),
             cache: HeedCache::open(dir.path()).expect("open cache"),
             inflight: InflightRequests::new(),
+            throttle: GoogleThrottle::new(
+                GOOGLE_RATE_LIMIT,
+                GOOGLE_RATE_WINDOW,
+                GOOGLE_MAX_QUEUED_REQUESTS,
+            ),
         });
         dir
     }
@@ -724,6 +857,11 @@ mod tests {
             api_key,
             cache: HeedCache::open(dir.path()).ok()?,
             inflight: InflightRequests::new(),
+            throttle: GoogleThrottle::new(
+                GOOGLE_RATE_LIMIT,
+                GOOGLE_RATE_WINDOW,
+                GOOGLE_MAX_QUEUED_REQUESTS,
+            ),
         });
         Some(dir)
     }
@@ -746,6 +884,167 @@ mod tests {
         let response = route_request(&Method::GET, &uri).await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn returns_whole_document_when_path_has_no_sheet_name() {
+        let _cache_dir = test_state();
+        let spreadsheet_id = "spreadsheet-document";
+        state()
+            .cache
+            .put_metadata(
+                &format!("metadata:{spreadsheet_id}"),
+                &Bytes::from_static(
+                    br#"{"sheets":[{"properties":{"title":"Sheet One"}},{"properties":{"title":"Sheet Two"}}]}"#,
+                ),
+                60,
+            )
+            .expect("put metadata");
+        state()
+            .cache
+            .put_values(
+                &format!("values:{spreadsheet_id}:Sheet One"),
+                &Bytes::from_static(br#"{"values":[["name"],["alice"]]}"#),
+                60,
+            )
+            .expect("put values");
+        state()
+            .cache
+            .put_values(
+                &format!("values:{spreadsheet_id}:Sheet Two"),
+                &Bytes::from_static(br#"{"values":[["name"],["bob"]]}"#),
+                60,
+            )
+            .expect("put values");
+
+        let uri: hyper::Uri = format!("/{spreadsheet_id}").parse().expect("uri");
+        let response = route_request(&Method::GET, &uri).await;
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            Bytes::from_static(br#"{"Sheet One":[{"name":"alice"}],"Sheet Two":[{"name":"bob"}]}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn serves_cached_google_values_from_raw_route() {
+        let _cache_dir = test_state();
+        let spreadsheet_id = "spreadsheet-raw-single";
+        let raw_body = Bytes::from_static(br#"{"values":[["name"],["alice"]]}"#);
+        state()
+            .cache
+            .put_metadata(
+                &format!("metadata:{spreadsheet_id}"),
+                &Bytes::from_static(br#"{"sheets":[{"properties":{"title":"Sheet One"}}]}"#),
+                60,
+            )
+            .expect("put metadata");
+        state()
+            .cache
+            .put_values(&format!("values:{spreadsheet_id}:Sheet One"), &raw_body, 60)
+            .expect("put values");
+
+        let uri: hyper::Uri = format!("/raw/{spreadsheet_id}/Sheet%20One")
+            .parse()
+            .expect("uri");
+        let response = route_request(&Method::GET, &uri).await;
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, raw_body);
+    }
+
+    #[tokio::test]
+    async fn serves_cached_google_values_for_whole_document_raw_route() {
+        let _cache_dir = test_state();
+        let spreadsheet_id = "spreadsheet-raw-document";
+        state()
+            .cache
+            .put_metadata(
+                &format!("metadata:{spreadsheet_id}"),
+                &Bytes::from_static(
+                    br#"{"sheets":[{"properties":{"title":"Sheet One"}},{"properties":{"title":"Sheet Two"}}]}"#,
+                ),
+                60,
+            )
+            .expect("put metadata");
+        state()
+            .cache
+            .put_values(
+                &format!("values:{spreadsheet_id}:Sheet One"),
+                &Bytes::from_static(br#"{"values":[["name"],["alice"]]}"#),
+                60,
+            )
+            .expect("put values");
+        state()
+            .cache
+            .put_values(
+                &format!("values:{spreadsheet_id}:Sheet Two"),
+                &Bytes::from_static(br#"{"values":[["name"],["bob"]]}"#),
+                60,
+            )
+            .expect("put values");
+
+        let uri: hyper::Uri = format!("/raw/{spreadsheet_id}").parse().expect("uri");
+        let response = route_request(&Method::GET, &uri).await;
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            Bytes::from_static(
+                br#"{"Sheet One":{"values":[["name"],["alice"]]},"Sheet Two":{"values":[["name"],["bob"]]}}"#,
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn ignores_trailing_slashes() {
+        let _cache_dir = test_state();
+        let spreadsheet_id = "spreadsheet-trailing";
+        state()
+            .cache
+            .put_values(
+                &format!("values:{spreadsheet_id}:Sheet One"),
+                &Bytes::from_static(br#"{"values":[["name"],["alice"]]}"#),
+                60,
+            )
+            .expect("put values");
+
+        let uri: hyper::Uri = format!("/{spreadsheet_id}/Sheet%20One/")
+            .parse()
+            .expect("uri");
+        let response = route_request(&Method::GET, &uri).await;
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, Bytes::from_static(br#"[{"name":"alice"}]"#));
     }
 
     #[tokio::test]
@@ -833,16 +1132,38 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires GOOGLE_API_KEY and TEST_SHEET_ID"]
-    async fn resolves_first_sheet_name_with_live_google_data() {
-        let _cache_dir = live_ready().expect("missing GOOGLE_API_KEY");
-        let sheet_id = env::var("TEST_SHEET_ID").expect("missing TEST_SHEET_ID");
+    async fn rejects_google_requests_when_throttle_queue_is_full() {
+        let throttle = Arc::new(GoogleThrottle::new(1, Duration::from_millis(200), 1));
 
-        let sheet_name = resolve_sheet_name(&sheet_id, "1")
+        throttle.acquire().await.expect("first slot");
+
+        let waiting = {
+            let throttle = throttle.clone();
+            tokio::spawn(async move { throttle.acquire().await })
+        };
+
+        sleep(Duration::from_millis(10)).await;
+
+        let error = throttle.acquire().await.expect_err("queue should be full");
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+
+        waiting
             .await
-            .expect("resolve first sheet");
+            .expect("waiting task panicked")
+            .expect("waiting slot");
+    }
 
-        assert!(!sheet_name.is_empty());
+    #[test]
+    fn extends_cache_ttl_under_queue_pressure() {
+        let throttle = GoogleThrottle::new(1, Duration::from_secs(60), GOOGLE_MAX_QUEUED_REQUESTS);
+
+        assert_eq!(throttle.cache_ttl_secs(), GOOGLE_CACHE_TTL_SECS);
+
+        let permits: Vec<_> = (0..8)
+            .map(|_| throttle.queue.try_acquire().expect("queue permit"))
+            .collect();
+        assert_eq!(throttle.cache_ttl_secs(), GOOGLE_CACHE_TTL_SECS * 2);
+        drop(permits);
     }
 
     #[tokio::test]
@@ -851,12 +1172,12 @@ mod tests {
         let _cache_dir = live_ready().expect("missing GOOGLE_API_KEY");
         let sheet_id = env::var("TEST_SHEET_ID").expect("missing TEST_SHEET_ID");
 
-        let json = fetch_sheet_json(&sheet_id, "1")
+        let json = fetch_document_json(&sheet_id)
             .await
             .expect("fetch sheet JSON");
 
         let payload: Value = serde_json::from_slice(&json).expect("valid JSON response");
-        assert!(payload.is_array());
+        assert!(payload.is_object());
     }
 
     #[test]

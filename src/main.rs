@@ -37,17 +37,17 @@ use tokio::{
     time::{Instant, sleep},
 };
 
-const README_URL: &str = "https://github.com/kigiri/gsheet#readme";
+const README_URL: &str = "https://github.com/devazuka/gsheet#readme";
 const BASE_ALLOWED_HEADERS: &str = "Origin, X-Requested-With, Content-Type, Accept";
-const SUCCESS_CACHE_CONTROL: &str = "public, max-age=60, s-maxage=60";
-const ERROR_CACHE_CONTROL: &str = "public, max-age=30, s-maxage=30";
 const ROUTE_FORMAT: &str =
     "URL format is /spreadsheet_id[/sheet_name] or /raw/spreadsheet_id[/sheet_name]";
-const GOOGLE_CACHE_TTL_SECS: u64 = 300;
-const GOOGLE_CACHE_TTL_MAX_SECS: u64 = 1200;
-const GOOGLE_RATE_LIMIT: usize = 300;
-const GOOGLE_RATE_WINDOW: Duration = Duration::from_secs(60);
-const GOOGLE_MAX_QUEUED_REQUESTS: usize = 64;
+const DEFAULT_SUCCESS_MAX_AGE_SECS: u64 = 60;
+const DEFAULT_ERROR_MAX_AGE_SECS: u64 = 30;
+const DEFAULT_GOOGLE_CACHE_TTL_SECS: u64 = 300;
+const DEFAULT_GOOGLE_CACHE_TTL_MAX_SECS: u64 = 1200;
+const DEFAULT_GOOGLE_RATE_LIMIT: usize = 300;
+const DEFAULT_GOOGLE_RATE_WINDOW_SECS: u64 = 60;
+const DEFAULT_GOOGLE_MAX_QUEUED_REQUESTS: usize = 64;
 const CACHE_DB: &str = "cache";
 const EXPIRY_DB: &str = "expiry";
 
@@ -64,6 +64,8 @@ struct State {
     api_key: String,
     cache: HeedCache,
     inflight: InflightRequests,
+    success_cache_control: String,
+    error_cache_control: String,
     throttle: GoogleThrottle,
 }
 
@@ -73,6 +75,20 @@ async fn main() {
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(3000);
+    let success_max_age_secs = env_u64("SUCCESS_MAX_AGE_SECS", DEFAULT_SUCCESS_MAX_AGE_SECS);
+    let error_max_age_secs = env_u64("ERROR_MAX_AGE_SECS", DEFAULT_ERROR_MAX_AGE_SECS);
+    let google_cache_ttl_secs = env_u64("GOOGLE_CACHE_TTL_SECS", DEFAULT_GOOGLE_CACHE_TTL_SECS);
+    let google_cache_ttl_max_secs = env_u64(
+        "GOOGLE_CACHE_TTL_MAX_SECS",
+        DEFAULT_GOOGLE_CACHE_TTL_MAX_SECS,
+    );
+    let google_rate_limit = env_usize("GOOGLE_RATE_LIMIT", DEFAULT_GOOGLE_RATE_LIMIT);
+    let google_rate_window_secs =
+        env_u64("GOOGLE_RATE_WINDOW_SECS", DEFAULT_GOOGLE_RATE_WINDOW_SECS);
+    let google_max_queued_requests = env_usize(
+        "GOOGLE_MAX_QUEUED_REQUESTS",
+        DEFAULT_GOOGLE_MAX_QUEUED_REQUESTS,
+    );
 
     let http = Client::builder(TokioExecutor::new()).build(
         HttpsConnectorBuilder::new()
@@ -87,10 +103,18 @@ async fn main() {
         cache: HeedCache::open(env::var("CACHE_DIR").unwrap_or_else(|_| "./data/heed".to_string()))
             .expect("failed to initialize cache"),
         inflight: InflightRequests::new(),
+        success_cache_control: format!(
+            "public, max-age={success_max_age_secs}, s-maxage={success_max_age_secs}"
+        ),
+        error_cache_control: format!(
+            "public, max-age={error_max_age_secs}, s-maxage={error_max_age_secs}"
+        ),
         throttle: GoogleThrottle::new(
-            GOOGLE_RATE_LIMIT,
-            GOOGLE_RATE_WINDOW,
-            GOOGLE_MAX_QUEUED_REQUESTS,
+            google_rate_limit,
+            Duration::from_secs(google_rate_window_secs),
+            google_max_queued_requests,
+            google_cache_ttl_secs,
+            google_cache_ttl_max_secs,
         ),
     };
     let _ = STATE.set(state);
@@ -186,7 +210,7 @@ async fn route_request(method: &Method, uri: &hyper::Uri) -> Response<ResBody> {
     };
 
     match result {
-        Ok(body) => json_response(StatusCode::OK, SUCCESS_CACHE_CONTROL, body),
+        Ok(body) => json_response(StatusCode::OK, &state().success_cache_control, body),
         Err(error) => error_response(error.message, error.status),
     }
 }
@@ -379,15 +403,27 @@ async fn fetch_json(url: &str) -> Result<(StatusCode, Bytes), GoogleError> {
 struct GoogleThrottle {
     limit: usize,
     window: Duration,
+    max_queued: usize,
+    base_ttl_secs: u64,
+    max_ttl_secs: u64,
     queue: Semaphore,
     recent: Mutex<VecDeque<Instant>>,
 }
 
 impl GoogleThrottle {
-    fn new(limit: usize, window: Duration, max_queued: usize) -> Self {
+    fn new(
+        limit: usize,
+        window: Duration,
+        max_queued: usize,
+        base_ttl_secs: u64,
+        max_ttl_secs: u64,
+    ) -> Self {
         Self {
             limit,
             window,
+            max_queued,
+            base_ttl_secs,
+            max_ttl_secs,
             queue: Semaphore::new(max_queued),
             recent: Mutex::new(VecDeque::with_capacity(limit)),
         }
@@ -428,7 +464,9 @@ impl GoogleThrottle {
     }
 
     fn cache_ttl_secs(&self) -> u64 {
-        let queued = GOOGLE_MAX_QUEUED_REQUESTS.saturating_sub(self.queue.available_permits());
+        let queued = self
+            .max_queued
+            .saturating_sub(self.queue.available_permits());
         let multiplier = if queued >= 48 {
             4
         } else if queued >= 24 {
@@ -439,7 +477,7 @@ impl GoogleThrottle {
             1
         };
 
-        (GOOGLE_CACHE_TTL_SECS * multiplier).min(GOOGLE_CACHE_TTL_MAX_SECS)
+        (self.base_ttl_secs * multiplier).min(self.max_ttl_secs)
     }
 }
 
@@ -625,12 +663,12 @@ fn error_response(message: String, status: StatusCode) -> Response<ResBody> {
     })
     .expect("failed to serialize error response");
 
-    json_response(status, ERROR_CACHE_CONTROL, body)
+    json_response(status, &state().error_cache_control, body)
 }
 
 fn json_response(
     status: StatusCode,
-    cache_control: &'static str,
+    cache_control: &str,
     body: impl Into<Bytes>,
 ) -> Response<ResBody> {
     let mut response = Response::new(Full::new(body.into()));
@@ -643,7 +681,10 @@ fn json_response(
         ACCESS_CONTROL_ALLOW_HEADERS,
         HeaderValue::from_static(BASE_ALLOWED_HEADERS),
     );
-    headers.insert(CACHE_CONTROL, HeaderValue::from_static(cache_control));
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_str(cache_control).expect("invalid cache control header"),
+    );
 
     response
 }
@@ -702,6 +743,20 @@ fn now_unix_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system time drifted before UNIX_EPOCH")
         .as_secs()
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
 }
 
 #[derive(Clone, Debug)]
@@ -833,10 +888,18 @@ mod tests {
             api_key: "test-key".to_string(),
             cache: HeedCache::open(dir.path()).expect("open cache"),
             inflight: InflightRequests::new(),
+            success_cache_control: format!(
+                "public, max-age={DEFAULT_SUCCESS_MAX_AGE_SECS}, s-maxage={DEFAULT_SUCCESS_MAX_AGE_SECS}"
+            ),
+            error_cache_control: format!(
+                "public, max-age={DEFAULT_ERROR_MAX_AGE_SECS}, s-maxage={DEFAULT_ERROR_MAX_AGE_SECS}"
+            ),
             throttle: GoogleThrottle::new(
-                GOOGLE_RATE_LIMIT,
-                GOOGLE_RATE_WINDOW,
-                GOOGLE_MAX_QUEUED_REQUESTS,
+                DEFAULT_GOOGLE_RATE_LIMIT,
+                Duration::from_secs(DEFAULT_GOOGLE_RATE_WINDOW_SECS),
+                DEFAULT_GOOGLE_MAX_QUEUED_REQUESTS,
+                DEFAULT_GOOGLE_CACHE_TTL_SECS,
+                DEFAULT_GOOGLE_CACHE_TTL_MAX_SECS,
             ),
         });
         dir
@@ -857,10 +920,18 @@ mod tests {
             api_key,
             cache: HeedCache::open(dir.path()).ok()?,
             inflight: InflightRequests::new(),
+            success_cache_control: format!(
+                "public, max-age={DEFAULT_SUCCESS_MAX_AGE_SECS}, s-maxage={DEFAULT_SUCCESS_MAX_AGE_SECS}"
+            ),
+            error_cache_control: format!(
+                "public, max-age={DEFAULT_ERROR_MAX_AGE_SECS}, s-maxage={DEFAULT_ERROR_MAX_AGE_SECS}"
+            ),
             throttle: GoogleThrottle::new(
-                GOOGLE_RATE_LIMIT,
-                GOOGLE_RATE_WINDOW,
-                GOOGLE_MAX_QUEUED_REQUESTS,
+                DEFAULT_GOOGLE_RATE_LIMIT,
+                Duration::from_secs(DEFAULT_GOOGLE_RATE_WINDOW_SECS),
+                DEFAULT_GOOGLE_MAX_QUEUED_REQUESTS,
+                DEFAULT_GOOGLE_CACHE_TTL_SECS,
+                DEFAULT_GOOGLE_CACHE_TTL_MAX_SECS,
             ),
         });
         Some(dir)
@@ -1133,7 +1204,13 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_google_requests_when_throttle_queue_is_full() {
-        let throttle = Arc::new(GoogleThrottle::new(1, Duration::from_millis(200), 1));
+        let throttle = Arc::new(GoogleThrottle::new(
+            1,
+            Duration::from_millis(200),
+            1,
+            300,
+            1200,
+        ));
 
         throttle.acquire().await.expect("first slot");
 
@@ -1155,14 +1232,20 @@ mod tests {
 
     #[test]
     fn extends_cache_ttl_under_queue_pressure() {
-        let throttle = GoogleThrottle::new(1, Duration::from_secs(60), GOOGLE_MAX_QUEUED_REQUESTS);
+        let throttle = GoogleThrottle::new(
+            1,
+            Duration::from_secs(60),
+            DEFAULT_GOOGLE_MAX_QUEUED_REQUESTS,
+            DEFAULT_GOOGLE_CACHE_TTL_SECS,
+            DEFAULT_GOOGLE_CACHE_TTL_MAX_SECS,
+        );
 
-        assert_eq!(throttle.cache_ttl_secs(), GOOGLE_CACHE_TTL_SECS);
+        assert_eq!(throttle.cache_ttl_secs(), DEFAULT_GOOGLE_CACHE_TTL_SECS);
 
         let permits: Vec<_> = (0..8)
             .map(|_| throttle.queue.try_acquire().expect("queue permit"))
             .collect();
-        assert_eq!(throttle.cache_ttl_secs(), GOOGLE_CACHE_TTL_SECS * 2);
+        assert_eq!(throttle.cache_ttl_secs(), DEFAULT_GOOGLE_CACHE_TTL_SECS * 2);
         drop(permits);
     }
 

@@ -73,18 +73,30 @@ Used for every successful sheet data request once the sheet title is known.
   - `Access-Control-Allow-Origin: *`
   - `Access-Control-Allow-Headers: Origin, X-Requested-With, Content-Type, Accept`
 - successful sheet responses include:
-  - `Cache-Control: public, max-age=60, s-maxage=60`
+  - `Cache-Control: public, max-age=60, s-maxage=60` by default
 - error responses include:
-  - `Cache-Control: public, max-age=30, s-maxage=30`
-- upstream Google cache entries start at `300` seconds
-- upstream Google cache entries can extend up to `1200` seconds when the Google request queue is under pressure
+  - `Cache-Control: public, max-age=30, s-maxage=30` by default
+- upstream Google cache entries start at `300` seconds by default
+- upstream Google cache entries can extend up to `1200` seconds by default when the Google request queue is under pressure
 
 ### Upstream throttling
 
-- Google API calls are limited to `300` requests per `60` seconds
+- Google API calls are limited to `300` requests per `60` seconds by default
 - the limiter is applied only to cache misses that actually call Google
-- at most `64` Google requests may wait in the local throttle queue
+- at most `64` Google requests may wait in the local throttle queue by default
 - if that queue is full, the request fails with `429`
+
+### Runtime configuration
+
+All of these are optional and keep the current defaults when unset:
+
+- `SUCCESS_MAX_AGE_SECS`
+- `ERROR_MAX_AGE_SECS`
+- `GOOGLE_CACHE_TTL_SECS`
+- `GOOGLE_CACHE_TTL_MAX_SECS`
+- `GOOGLE_RATE_LIMIT`
+- `GOOGLE_RATE_WINDOW_SECS`
+- `GOOGLE_MAX_QUEUED_REQUESTS`
 
 ### Error shape
 
@@ -93,7 +105,7 @@ All handled errors return:
 ```json
 {
   "error": "message",
-  "documentation": "https://github.com/benborgers/opensheet#readme"
+  "documentation": "https://github.com/devazuka/gsheet#readme"
 }
 ```
 
@@ -114,13 +126,13 @@ All handled errors return:
 - row-to-object JSON transformation
 - CORS and fixed cache headers
 - JSON error format
-- `heed` cache for raw Google metadata payloads
-- `heed` cache for raw Google values payloads
+- `lmdb` cache for raw Google metadata payloads
+- `lmdb` cache for raw Google values payloads
 - in-process dedupe for in-flight upstream Google fetches
 - upstream Google throttle with bounded queue and `429` overflow
 
 Notes:
 - the Rust service caches raw Google responses and shapes them after cache retrieval
-- expired `heed` entries are deleted on read instead of accumulating indefinitely
+- expired `lmdb` entries are deleted on read instead of accumulating indefinitely
 - trailing `/` characters are normalized away during routing
 - analytics is still not implemented

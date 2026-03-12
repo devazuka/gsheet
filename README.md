@@ -1,5 +1,7 @@
 # GSheet
 
+[![publish-image](https://github.com/devazuka/gsheet/actions/workflows/publish-image.yml/badge.svg)](https://github.com/devazuka/gsheet/actions/workflows/publish-image.yml)
+
 A more convenient way to use Google Sheets as your backend data.
 
 Heavily inspired by [opensheet](https://github.com/benborgers/opensheet#readme) from [@benborgers](https://github.com/benborgers).

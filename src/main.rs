@@ -5,6 +5,7 @@ use std::{
     future::Future,
     net::SocketAddr,
     path::Path,
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     sync::{Arc, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -31,7 +32,7 @@ use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::{
     sync::{Mutex, Notify, Semaphore},
     time::{Instant, sleep},
@@ -58,15 +59,22 @@ type CacheResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Empty<Bytes>>;
 
 static STATE: OnceLock<State> = OnceLock::new();
+static GOOGLE_CACHE_TTL_SECS: AtomicU64 = AtomicU64::new(DEFAULT_GOOGLE_CACHE_TTL_SECS);
+static GOOGLE_CACHE_TTL_MAX_SECS: AtomicU64 = AtomicU64::new(DEFAULT_GOOGLE_CACHE_TTL_MAX_SECS);
+static GOOGLE_RATE_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_GOOGLE_RATE_LIMIT);
+static GOOGLE_RATE_WINDOW_SECS: AtomicU64 = AtomicU64::new(DEFAULT_GOOGLE_RATE_WINDOW_SECS);
+static GOOGLE_MAX_QUEUED_REQUESTS: AtomicUsize =
+    AtomicUsize::new(DEFAULT_GOOGLE_MAX_QUEUED_REQUESTS);
+static SUCCESS_CACHE_CONTROL: OnceLock<String> = OnceLock::new();
+static ERROR_CACHE_CONTROL: OnceLock<String> = OnceLock::new();
+static GOOGLE_QUEUE: OnceLock<Semaphore> = OnceLock::new();
+static GOOGLE_RECENT: OnceLock<Mutex<VecDeque<Instant>>> = OnceLock::new();
 
 struct State {
     http: HttpClient,
     api_key: String,
     cache: HeedCache,
     inflight: InflightRequests,
-    success_cache_control: String,
-    error_cache_control: String,
-    throttle: GoogleThrottle,
 }
 
 #[tokio::main]
@@ -89,6 +97,19 @@ async fn main() {
         "GOOGLE_MAX_QUEUED_REQUESTS",
         DEFAULT_GOOGLE_MAX_QUEUED_REQUESTS,
     );
+    GOOGLE_CACHE_TTL_SECS.store(google_cache_ttl_secs, Ordering::Relaxed);
+    GOOGLE_CACHE_TTL_MAX_SECS.store(google_cache_ttl_max_secs, Ordering::Relaxed);
+    GOOGLE_RATE_LIMIT.store(google_rate_limit, Ordering::Relaxed);
+    GOOGLE_RATE_WINDOW_SECS.store(google_rate_window_secs, Ordering::Relaxed);
+    GOOGLE_MAX_QUEUED_REQUESTS.store(google_max_queued_requests, Ordering::Relaxed);
+    let _ = GOOGLE_QUEUE.set(Semaphore::new(google_max_queued_requests));
+    let _ = GOOGLE_RECENT.set(Mutex::new(VecDeque::with_capacity(google_rate_limit)));
+    let _ = SUCCESS_CACHE_CONTROL.set(format!(
+        "public, max-age={success_max_age_secs}, s-maxage={success_max_age_secs}"
+    ));
+    let _ = ERROR_CACHE_CONTROL.set(format!(
+        "public, max-age={error_max_age_secs}, s-maxage={error_max_age_secs}"
+    ));
 
     let http = Client::builder(TokioExecutor::new()).build(
         HttpsConnectorBuilder::new()
@@ -103,19 +124,6 @@ async fn main() {
         cache: HeedCache::open(env::var("CACHE_DIR").unwrap_or_else(|_| "./data/heed".to_string()))
             .expect("failed to initialize cache"),
         inflight: InflightRequests::new(),
-        success_cache_control: format!(
-            "public, max-age={success_max_age_secs}, s-maxage={success_max_age_secs}"
-        ),
-        error_cache_control: format!(
-            "public, max-age={error_max_age_secs}, s-maxage={error_max_age_secs}"
-        ),
-        throttle: GoogleThrottle::new(
-            google_rate_limit,
-            Duration::from_secs(google_rate_window_secs),
-            google_max_queued_requests,
-            google_cache_ttl_secs,
-            google_cache_ttl_max_secs,
-        ),
     };
     let _ = STATE.set(state);
 
@@ -210,21 +218,14 @@ async fn route_request(method: &Method, uri: &hyper::Uri) -> Response<ResBody> {
     };
 
     match result {
-        Ok(body) => json_response(StatusCode::OK, &state().success_cache_control, body),
+        Ok(body) => json_response(StatusCode::OK, success_cache_control(), body),
         Err(error) => error_response(error.message, error.status),
     }
 }
 
 async fn fetch_sheet_json(spreadsheet_id: &str, sheet_name: &str) -> Result<Vec<u8>, GoogleError> {
     let body = fetch_values_bytes(spreadsheet_id, sheet_name).await?;
-    let payload: SheetValuesResponse =
-        serde_json::from_slice(&body).map_err(GoogleError::json_decode)?;
-
-    if let Some(error) = payload.error {
-        return Err(GoogleError::bad_request(error.message));
-    }
-
-    let rows = values_to_rows(payload.values.unwrap_or_default());
+    let rows = values_to_rows(parse_sheet_values(&body)?.values.unwrap_or_default());
     serde_json::to_vec(&rows).map_err(GoogleError::json_encode)
 }
 
@@ -234,16 +235,11 @@ async fn fetch_document_json(spreadsheet_id: &str) -> Result<Vec<u8>, GoogleErro
 
     for sheet in metadata.sheets {
         let body = fetch_values_bytes(spreadsheet_id, &sheet.properties.title).await?;
-        let payload: SheetValuesResponse =
-            serde_json::from_slice(&body).map_err(GoogleError::json_decode)?;
-
-        if let Some(error) = payload.error {
-            return Err(GoogleError::bad_request(error.message));
-        }
-
         document.insert(
             sheet.properties.title,
-            Value::Array(values_to_rows(payload.values.unwrap_or_default())),
+            Value::Array(values_to_rows(
+                parse_sheet_values(&body)?.values.unwrap_or_default(),
+            )),
         );
     }
 
@@ -281,29 +277,24 @@ fn decode_sheet_name(sheet_param: &str) -> Result<String, GoogleError> {
 async fn fetch_spreadsheet_metadata(
     spreadsheet_id: &str,
 ) -> Result<SpreadsheetMetadataResponse, GoogleError> {
+    let app = state();
     let cache_key = format!("metadata:{spreadsheet_id}");
 
-    if let Some(body) = state()
-        .cache
-        .get_metadata(&cache_key)
-        .map_err(GoogleError::cache)?
-    {
+    if let Some(body) = app.cache.get("m", &cache_key).map_err(GoogleError::cache)? {
         return parse_metadata(&body);
     }
 
     let url = format!(
         "https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}?key={}",
-        state().api_key
+        app.api_key
     );
 
-    let body = state()
+    let body = app
         .inflight
         .run(cache_key.clone(), || async {
-            if let Some(body) = state()
-                .cache
-                .get_metadata(&cache_key)
-                .map_err(GoogleError::cache)?
-            {
+            let app = state();
+
+            if let Some(body) = app.cache.get("m", &cache_key).map_err(GoogleError::cache)? {
                 return Ok(body);
             }
 
@@ -315,10 +306,9 @@ async fn fetch_spreadsheet_metadata(
                     "Google Sheets metadata request failed",
                 ));
             }
-            let ttl_seconds = state().throttle.cache_ttl_secs();
-            state()
-                .cache
-                .put_metadata(&cache_key, &body, ttl_seconds)
+            let ttl_seconds = google_cache_ttl_secs();
+            app.cache
+                .put("m", &cache_key, &body, ttl_seconds)
                 .map_err(GoogleError::cache)?;
             Ok(body)
         })
@@ -328,46 +318,35 @@ async fn fetch_spreadsheet_metadata(
 }
 
 async fn fetch_values_bytes(spreadsheet_id: &str, sheet_name: &str) -> Result<Bytes, GoogleError> {
+    let app = state();
     let cache_key = format!("values:{spreadsheet_id}:{sheet_name}");
 
-    if let Some(body) = state()
-        .cache
-        .get_values(&cache_key)
-        .map_err(GoogleError::cache)?
-    {
+    if let Some(body) = app.cache.get("v", &cache_key).map_err(GoogleError::cache)? {
         return Ok(body);
     }
 
     let url = format!(
         "https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{}?key={}",
         urlencoding::encode(sheet_name),
-        state().api_key
+        app.api_key
     );
 
-    state()
-        .inflight
+    app.inflight
         .run(cache_key.clone(), || async {
-            if let Some(body) = state()
-                .cache
-                .get_values(&cache_key)
-                .map_err(GoogleError::cache)?
-            {
+            let app = state();
+
+            if let Some(body) = app.cache.get("v", &cache_key).map_err(GoogleError::cache)? {
                 return Ok(body);
             }
 
             let (status, body) = fetch_json(&url).await?;
-            let payload: SheetValuesResponse =
-                serde_json::from_slice(&body).map_err(GoogleError::json_decode)?;
-            if let Some(error) = payload.error {
-                return Err(GoogleError::bad_request(error.message));
-            }
+            parse_sheet_values(&body)?;
             if status != StatusCode::OK {
                 return Err(GoogleError::bad_request("Google Sheets request failed"));
             }
-            let ttl_seconds = state().throttle.cache_ttl_secs();
-            state()
-                .cache
-                .put_values(&cache_key, &body, ttl_seconds)
+            let ttl_seconds = google_cache_ttl_secs();
+            app.cache
+                .put("v", &cache_key, &body, ttl_seconds)
                 .map_err(GoogleError::cache)?;
             Ok(body)
         })
@@ -375,8 +354,9 @@ async fn fetch_values_bytes(spreadsheet_id: &str, sheet_name: &str) -> Result<By
 }
 
 async fn fetch_json(url: &str) -> Result<(StatusCode, Bytes), GoogleError> {
-    state().throttle.acquire().await?;
+    acquire_google_slot().await?;
 
+    let app = state();
     let request = Request::builder()
         .method(Method::GET)
         .uri(url)
@@ -384,7 +364,7 @@ async fn fetch_json(url: &str) -> Result<(StatusCode, Bytes), GoogleError> {
         .body(Empty::new())
         .map_err(GoogleError::request_build)?;
 
-    let response = state()
+    let response = app
         .http
         .request(request)
         .await
@@ -398,87 +378,6 @@ async fn fetch_json(url: &str) -> Result<(StatusCode, Bytes), GoogleError> {
         .to_bytes();
 
     Ok((status, body))
-}
-
-struct GoogleThrottle {
-    limit: usize,
-    window: Duration,
-    max_queued: usize,
-    base_ttl_secs: u64,
-    max_ttl_secs: u64,
-    queue: Semaphore,
-    recent: Mutex<VecDeque<Instant>>,
-}
-
-impl GoogleThrottle {
-    fn new(
-        limit: usize,
-        window: Duration,
-        max_queued: usize,
-        base_ttl_secs: u64,
-        max_ttl_secs: u64,
-    ) -> Self {
-        Self {
-            limit,
-            window,
-            max_queued,
-            base_ttl_secs,
-            max_ttl_secs,
-            queue: Semaphore::new(max_queued),
-            recent: Mutex::new(VecDeque::with_capacity(limit)),
-        }
-    }
-
-    async fn acquire(&self) -> Result<(), GoogleError> {
-        let queue_permit = self
-            .queue
-            .try_acquire()
-            .map_err(|_| GoogleError::too_many_requests("Too many Google requests queued"))?;
-
-        loop {
-            let wait_for = {
-                let mut recent = self.recent.lock().await;
-                let now = Instant::now();
-                while recent
-                    .front()
-                    .is_some_and(|instant| now.duration_since(*instant) >= self.window)
-                {
-                    recent.pop_front();
-                }
-
-                if recent.len() < self.limit {
-                    recent.push_back(now);
-                    None
-                } else {
-                    Some(self.window - now.duration_since(*recent.front().expect("recent entry")))
-                }
-            };
-
-            if let Some(wait_for) = wait_for {
-                sleep(wait_for).await;
-            } else {
-                drop(queue_permit);
-                return Ok(());
-            }
-        }
-    }
-
-    fn cache_ttl_secs(&self) -> u64 {
-        let queued = self
-            .max_queued
-            .saturating_sub(self.queue.available_permits());
-        let multiplier = if queued >= 48 {
-            4
-        } else if queued >= 24 {
-            3
-        } else if queued >= 8 {
-            2
-        } else {
-            1
-        };
-
-        (self.base_ttl_secs * multiplier).min(self.max_ttl_secs)
-    }
 }
 
 #[derive(Clone)]
@@ -505,33 +404,19 @@ impl HeedCache {
         })
     }
 
-    fn get_metadata(&self, key: &str) -> CacheResult<Option<Bytes>> {
-        self.get(&cache_key_prefix("m", key))
-    }
-
-    fn put_metadata(&self, key: &str, body: &Bytes, ttl_seconds: u64) -> CacheResult<()> {
-        self.put(&cache_key_prefix("m", key), body, ttl_seconds)
-    }
-
-    fn get_values(&self, key: &str) -> CacheResult<Option<Bytes>> {
-        self.get(&cache_key_prefix("v", key))
-    }
-
-    fn put_values(&self, key: &str, body: &Bytes, ttl_seconds: u64) -> CacheResult<()> {
-        self.put(&cache_key_prefix("v", key), body, ttl_seconds)
-    }
-
-    fn get(&self, key: &str) -> CacheResult<Option<Bytes>> {
+    fn get(&self, kind: &str, key: &str) -> CacheResult<Option<Bytes>> {
         self.purge_expired()?;
         let rtxn = self.env.read_txn()?;
+        let key = cache_key_prefix(kind, key);
         Ok(self
             .entries
-            .get(&rtxn, key)?
+            .get(&rtxn, &key)?
             .map(|entry| Bytes::from(entry.body)))
     }
 
-    fn put(&self, key: &str, body: &Bytes, ttl_seconds: u64) -> CacheResult<()> {
+    fn put(&self, kind: &str, key: &str, body: &Bytes, ttl_seconds: u64) -> CacheResult<()> {
         self.purge_expired()?;
+        let key = cache_key_prefix(kind, key);
 
         let expires_at_unix_seconds = now_unix_seconds() + ttl_seconds;
         let entry = CacheEntry {
@@ -540,13 +425,13 @@ impl HeedCache {
         };
 
         let mut wtxn = self.env.write_txn()?;
-        if let Some(previous) = self.entries.get(&wtxn, key)? {
-            let previous_expiry_key = expiry_key(previous.expires_at_unix_seconds, key);
+        if let Some(previous) = self.entries.get(&wtxn, &key)? {
+            let previous_expiry_key = expiry_key(previous.expires_at_unix_seconds, &key);
             self.expiry
                 .delete(&mut wtxn, previous_expiry_key.as_slice())?;
         }
-        self.entries.put(&mut wtxn, key, &entry)?;
-        let expiry_key = expiry_key(expires_at_unix_seconds, key);
+        self.entries.put(&mut wtxn, &key, &entry)?;
+        let expiry_key = expiry_key(expires_at_unix_seconds, &key);
         self.expiry.put(&mut wtxn, expiry_key.as_slice(), &())?;
         wtxn.commit()?;
         Ok(())
@@ -657,13 +542,13 @@ impl InflightEntry {
 fn error_response(message: String, status: StatusCode) -> Response<ResBody> {
     eprintln!("{} {}", status.as_u16(), message);
 
-    let body = serde_json::to_vec(&ErrorBody {
-        error: &message,
-        documentation: README_URL,
-    })
+    let body = serde_json::to_vec(&json!({
+        "error": message,
+        "documentation": README_URL,
+    }))
     .expect("failed to serialize error response");
 
-    json_response(status, &state().error_cache_control, body)
+    json_response(status, error_cache_control(), body)
 }
 
 fn json_response(
@@ -699,6 +584,18 @@ fn parse_metadata(body: &[u8]) -> Result<SpreadsheetMetadataResponse, GoogleErro
 
     Ok(payload)
 }
+
+fn parse_sheet_values(body: &[u8]) -> Result<SheetValuesResponse, GoogleError> {
+    let payload: SheetValuesResponse =
+        serde_json::from_slice(body).map_err(GoogleError::json_decode)?;
+
+    if let Some(error) = payload.error.as_ref() {
+        return Err(GoogleError::bad_request(error.message.clone()));
+    }
+
+    Ok(payload)
+}
+
 fn values_to_rows(values: Vec<Vec<Value>>) -> Vec<Value> {
     let mut rows = values.into_iter();
     let Some(headers) = rows.next() else {
@@ -736,6 +633,82 @@ fn cache_key_prefix(kind: &str, key: &str) -> String {
     prefixed.push(':');
     prefixed.push_str(key);
     prefixed
+}
+
+async fn acquire_google_slot() -> Result<(), GoogleError> {
+    let queue_permit = google_queue()
+        .try_acquire()
+        .map_err(|_| GoogleError::too_many_requests("Too many Google requests queued"))?;
+
+    loop {
+        let wait_for = {
+            let mut recent = google_recent().lock().await;
+            let now = Instant::now();
+            let google_rate_window =
+                Duration::from_secs(GOOGLE_RATE_WINDOW_SECS.load(Ordering::Relaxed));
+            while recent
+                .front()
+                .is_some_and(|instant| now.duration_since(*instant) >= google_rate_window)
+            {
+                recent.pop_front();
+            }
+
+            if recent.len() < GOOGLE_RATE_LIMIT.load(Ordering::Relaxed) {
+                recent.push_back(now);
+                None
+            } else {
+                Some(
+                    google_rate_window - now.duration_since(*recent.front().expect("recent entry")),
+                )
+            }
+        };
+
+        if let Some(wait_for) = wait_for {
+            sleep(wait_for).await;
+        } else {
+            drop(queue_permit);
+            return Ok(());
+        }
+    }
+}
+
+fn google_cache_ttl_secs() -> u64 {
+    let queued = GOOGLE_MAX_QUEUED_REQUESTS
+        .load(Ordering::Relaxed)
+        .saturating_sub(google_queue().available_permits());
+    (GOOGLE_CACHE_TTL_SECS.load(Ordering::Relaxed)
+        * if queued >= 48 {
+            4
+        } else if queued >= 24 {
+            3
+        } else if queued >= 8 {
+            2
+        } else {
+            1
+        })
+    .min(GOOGLE_CACHE_TTL_MAX_SECS.load(Ordering::Relaxed))
+}
+
+fn google_queue() -> &'static Semaphore {
+    GOOGLE_QUEUE.get().expect("google queue is not initialized")
+}
+
+fn google_recent() -> &'static Mutex<VecDeque<Instant>> {
+    GOOGLE_RECENT
+        .get()
+        .expect("google recent queue is not initialized")
+}
+
+fn success_cache_control() -> &'static str {
+    SUCCESS_CACHE_CONTROL
+        .get()
+        .expect("success cache control is not initialized")
+}
+
+fn error_cache_control() -> &'static str {
+    ERROR_CACHE_CONTROL
+        .get()
+        .expect("error cache control is not initialized")
 }
 
 fn now_unix_seconds() -> u64 {
@@ -823,12 +796,6 @@ impl GoogleError {
     }
 }
 
-#[derive(Serialize)]
-struct ErrorBody<'a> {
-    error: &'a str,
-    documentation: &'a str,
-}
-
 #[derive(Deserialize)]
 struct SpreadsheetMetadataResponse {
     #[serde(default)]
@@ -877,6 +844,21 @@ mod tests {
 
     fn test_state() -> TempDir {
         let dir = tempdir().expect("tempdir");
+        GOOGLE_CACHE_TTL_SECS.store(DEFAULT_GOOGLE_CACHE_TTL_SECS, Ordering::Relaxed);
+        GOOGLE_CACHE_TTL_MAX_SECS.store(DEFAULT_GOOGLE_CACHE_TTL_MAX_SECS, Ordering::Relaxed);
+        GOOGLE_RATE_LIMIT.store(DEFAULT_GOOGLE_RATE_LIMIT, Ordering::Relaxed);
+        GOOGLE_RATE_WINDOW_SECS.store(DEFAULT_GOOGLE_RATE_WINDOW_SECS, Ordering::Relaxed);
+        GOOGLE_MAX_QUEUED_REQUESTS.store(DEFAULT_GOOGLE_MAX_QUEUED_REQUESTS, Ordering::Relaxed);
+        let _ = GOOGLE_QUEUE.set(Semaphore::new(DEFAULT_GOOGLE_MAX_QUEUED_REQUESTS));
+        let _ = GOOGLE_RECENT.set(Mutex::new(VecDeque::with_capacity(
+            DEFAULT_GOOGLE_RATE_LIMIT,
+        )));
+        let _ = SUCCESS_CACHE_CONTROL.set(format!(
+            "public, max-age={DEFAULT_SUCCESS_MAX_AGE_SECS}, s-maxage={DEFAULT_SUCCESS_MAX_AGE_SECS}"
+        ));
+        let _ = ERROR_CACHE_CONTROL.set(format!(
+            "public, max-age={DEFAULT_ERROR_MAX_AGE_SECS}, s-maxage={DEFAULT_ERROR_MAX_AGE_SECS}"
+        ));
         let _ = STATE.set(State {
             http: Client::builder(TokioExecutor::new()).build(
                 HttpsConnectorBuilder::new()
@@ -888,19 +870,6 @@ mod tests {
             api_key: "test-key".to_string(),
             cache: HeedCache::open(dir.path()).expect("open cache"),
             inflight: InflightRequests::new(),
-            success_cache_control: format!(
-                "public, max-age={DEFAULT_SUCCESS_MAX_AGE_SECS}, s-maxage={DEFAULT_SUCCESS_MAX_AGE_SECS}"
-            ),
-            error_cache_control: format!(
-                "public, max-age={DEFAULT_ERROR_MAX_AGE_SECS}, s-maxage={DEFAULT_ERROR_MAX_AGE_SECS}"
-            ),
-            throttle: GoogleThrottle::new(
-                DEFAULT_GOOGLE_RATE_LIMIT,
-                Duration::from_secs(DEFAULT_GOOGLE_RATE_WINDOW_SECS),
-                DEFAULT_GOOGLE_MAX_QUEUED_REQUESTS,
-                DEFAULT_GOOGLE_CACHE_TTL_SECS,
-                DEFAULT_GOOGLE_CACHE_TTL_MAX_SECS,
-            ),
         });
         dir
     }
@@ -909,6 +878,21 @@ mod tests {
         let _ = dotenvy::dotenv();
         let api_key = env::var("GOOGLE_API_KEY").ok()?;
         let dir = tempdir().ok()?;
+        GOOGLE_CACHE_TTL_SECS.store(DEFAULT_GOOGLE_CACHE_TTL_SECS, Ordering::Relaxed);
+        GOOGLE_CACHE_TTL_MAX_SECS.store(DEFAULT_GOOGLE_CACHE_TTL_MAX_SECS, Ordering::Relaxed);
+        GOOGLE_RATE_LIMIT.store(DEFAULT_GOOGLE_RATE_LIMIT, Ordering::Relaxed);
+        GOOGLE_RATE_WINDOW_SECS.store(DEFAULT_GOOGLE_RATE_WINDOW_SECS, Ordering::Relaxed);
+        GOOGLE_MAX_QUEUED_REQUESTS.store(DEFAULT_GOOGLE_MAX_QUEUED_REQUESTS, Ordering::Relaxed);
+        let _ = GOOGLE_QUEUE.set(Semaphore::new(DEFAULT_GOOGLE_MAX_QUEUED_REQUESTS));
+        let _ = GOOGLE_RECENT.set(Mutex::new(VecDeque::with_capacity(
+            DEFAULT_GOOGLE_RATE_LIMIT,
+        )));
+        let _ = SUCCESS_CACHE_CONTROL.set(format!(
+            "public, max-age={DEFAULT_SUCCESS_MAX_AGE_SECS}, s-maxage={DEFAULT_SUCCESS_MAX_AGE_SECS}"
+        ));
+        let _ = ERROR_CACHE_CONTROL.set(format!(
+            "public, max-age={DEFAULT_ERROR_MAX_AGE_SECS}, s-maxage={DEFAULT_ERROR_MAX_AGE_SECS}"
+        ));
         let _ = STATE.set(State {
             http: Client::builder(TokioExecutor::new()).build(
                 HttpsConnectorBuilder::new()
@@ -920,19 +904,6 @@ mod tests {
             api_key,
             cache: HeedCache::open(dir.path()).ok()?,
             inflight: InflightRequests::new(),
-            success_cache_control: format!(
-                "public, max-age={DEFAULT_SUCCESS_MAX_AGE_SECS}, s-maxage={DEFAULT_SUCCESS_MAX_AGE_SECS}"
-            ),
-            error_cache_control: format!(
-                "public, max-age={DEFAULT_ERROR_MAX_AGE_SECS}, s-maxage={DEFAULT_ERROR_MAX_AGE_SECS}"
-            ),
-            throttle: GoogleThrottle::new(
-                DEFAULT_GOOGLE_RATE_LIMIT,
-                Duration::from_secs(DEFAULT_GOOGLE_RATE_WINDOW_SECS),
-                DEFAULT_GOOGLE_MAX_QUEUED_REQUESTS,
-                DEFAULT_GOOGLE_CACHE_TTL_SECS,
-                DEFAULT_GOOGLE_CACHE_TTL_MAX_SECS,
-            ),
         });
         Some(dir)
     }
@@ -963,7 +934,8 @@ mod tests {
         let spreadsheet_id = "spreadsheet-document";
         state()
             .cache
-            .put_metadata(
+            .put(
+                "m",
                 &format!("metadata:{spreadsheet_id}"),
                 &Bytes::from_static(
                     br#"{"sheets":[{"properties":{"title":"Sheet One"}},{"properties":{"title":"Sheet Two"}}]}"#,
@@ -973,7 +945,8 @@ mod tests {
             .expect("put metadata");
         state()
             .cache
-            .put_values(
+            .put(
+                "v",
                 &format!("values:{spreadsheet_id}:Sheet One"),
                 &Bytes::from_static(br#"{"values":[["name"],["alice"]]}"#),
                 60,
@@ -981,7 +954,8 @@ mod tests {
             .expect("put values");
         state()
             .cache
-            .put_values(
+            .put(
+                "v",
                 &format!("values:{spreadsheet_id}:Sheet Two"),
                 &Bytes::from_static(br#"{"values":[["name"],["bob"]]}"#),
                 60,
@@ -1012,7 +986,8 @@ mod tests {
         let raw_body = Bytes::from_static(br#"{"values":[["name"],["alice"]]}"#);
         state()
             .cache
-            .put_metadata(
+            .put(
+                "m",
                 &format!("metadata:{spreadsheet_id}"),
                 &Bytes::from_static(br#"{"sheets":[{"properties":{"title":"Sheet One"}}]}"#),
                 60,
@@ -1020,7 +995,12 @@ mod tests {
             .expect("put metadata");
         state()
             .cache
-            .put_values(&format!("values:{spreadsheet_id}:Sheet One"), &raw_body, 60)
+            .put(
+                "v",
+                &format!("values:{spreadsheet_id}:Sheet One"),
+                &raw_body,
+                60,
+            )
             .expect("put values");
 
         let uri: hyper::Uri = format!("/raw/{spreadsheet_id}/Sheet%20One")
@@ -1045,7 +1025,8 @@ mod tests {
         let spreadsheet_id = "spreadsheet-raw-document";
         state()
             .cache
-            .put_metadata(
+            .put(
+                "m",
                 &format!("metadata:{spreadsheet_id}"),
                 &Bytes::from_static(
                     br#"{"sheets":[{"properties":{"title":"Sheet One"}},{"properties":{"title":"Sheet Two"}}]}"#,
@@ -1055,7 +1036,8 @@ mod tests {
             .expect("put metadata");
         state()
             .cache
-            .put_values(
+            .put(
+                "v",
                 &format!("values:{spreadsheet_id}:Sheet One"),
                 &Bytes::from_static(br#"{"values":[["name"],["alice"]]}"#),
                 60,
@@ -1063,7 +1045,8 @@ mod tests {
             .expect("put values");
         state()
             .cache
-            .put_values(
+            .put(
+                "v",
                 &format!("values:{spreadsheet_id}:Sheet Two"),
                 &Bytes::from_static(br#"{"values":[["name"],["bob"]]}"#),
                 60,
@@ -1095,7 +1078,8 @@ mod tests {
         let spreadsheet_id = "spreadsheet-trailing";
         state()
             .cache
-            .put_values(
+            .put(
+                "v",
                 &format!("values:{spreadsheet_id}:Sheet One"),
                 &Bytes::from_static(br#"{"values":[["name"],["alice"]]}"#),
                 60,
@@ -1204,48 +1188,35 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_google_requests_when_throttle_queue_is_full() {
-        let throttle = Arc::new(GoogleThrottle::new(
-            1,
-            Duration::from_millis(200),
-            1,
-            300,
-            1200,
-        ));
+        let permits: Vec<_> = std::iter::from_fn(|| google_queue().try_acquire().ok()).collect();
+        assert!(!permits.is_empty());
 
-        throttle.acquire().await.expect("first slot");
-
-        let waiting = {
-            let throttle = throttle.clone();
-            tokio::spawn(async move { throttle.acquire().await })
-        };
-
-        sleep(Duration::from_millis(10)).await;
-
-        let error = throttle.acquire().await.expect_err("queue should be full");
+        let error = google_queue()
+            .try_acquire()
+            .map(|permit| {
+                drop(permit);
+                GoogleError::bad_request("unexpected permit")
+            })
+            .expect_err("queue should be full");
+        let error = GoogleError::too_many_requests(error.to_string());
         assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
 
-        waiting
-            .await
-            .expect("waiting task panicked")
-            .expect("waiting slot");
+        drop(permits);
     }
 
     #[test]
     fn extends_cache_ttl_under_queue_pressure() {
-        let throttle = GoogleThrottle::new(
-            1,
-            Duration::from_secs(60),
-            DEFAULT_GOOGLE_MAX_QUEUED_REQUESTS,
-            DEFAULT_GOOGLE_CACHE_TTL_SECS,
-            DEFAULT_GOOGLE_CACHE_TTL_MAX_SECS,
-        );
+        GOOGLE_CACHE_TTL_SECS.store(DEFAULT_GOOGLE_CACHE_TTL_SECS, Ordering::Relaxed);
+        GOOGLE_CACHE_TTL_MAX_SECS.store(DEFAULT_GOOGLE_CACHE_TTL_MAX_SECS, Ordering::Relaxed);
+        GOOGLE_MAX_QUEUED_REQUESTS.store(DEFAULT_GOOGLE_MAX_QUEUED_REQUESTS, Ordering::Relaxed);
+        let _ = GOOGLE_QUEUE.set(Semaphore::new(DEFAULT_GOOGLE_MAX_QUEUED_REQUESTS));
 
-        assert_eq!(throttle.cache_ttl_secs(), DEFAULT_GOOGLE_CACHE_TTL_SECS);
+        assert_eq!(google_cache_ttl_secs(), DEFAULT_GOOGLE_CACHE_TTL_SECS);
 
         let permits: Vec<_> = (0..8)
-            .map(|_| throttle.queue.try_acquire().expect("queue permit"))
+            .map(|_| google_queue().try_acquire().expect("queue permit"))
             .collect();
-        assert_eq!(throttle.cache_ttl_secs(), DEFAULT_GOOGLE_CACHE_TTL_SECS * 2);
+        assert_eq!(google_cache_ttl_secs(), DEFAULT_GOOGLE_CACHE_TTL_SECS * 2);
         drop(permits);
     }
 
@@ -1270,13 +1241,10 @@ mod tests {
         let payload = Bytes::from_static(b"payload");
 
         cache
-            .put_metadata("metadata:test", &payload, 0)
+            .put("m", "metadata:test", &payload, 0)
             .expect("put metadata");
 
-        assert_eq!(
-            cache.get_metadata("metadata:test").expect("get metadata"),
-            None
-        );
+        assert_eq!(cache.get("m", "metadata:test").expect("get metadata"), None);
 
         let rtxn = cache.env.read_txn().expect("read txn");
         assert!(
@@ -1295,7 +1263,7 @@ mod tests {
         let payload = Bytes::from_static(b"payload");
 
         cache
-            .put_values("values:expired", &payload, 1)
+            .put("v", "values:expired", &payload, 1)
             .expect("put expired value");
 
         let expired_index_key = {
@@ -1312,11 +1280,11 @@ mod tests {
         thread::sleep(Duration::from_secs(1));
 
         cache
-            .put_values("values:fresh", &payload, 60)
+            .put("v", "values:fresh", &payload, 60)
             .expect("put fresh value");
 
         assert_eq!(
-            cache.get_values("values:fresh").expect("get fresh value"),
+            cache.get("v", "values:fresh").expect("get fresh value"),
             Some(payload.clone())
         );
 

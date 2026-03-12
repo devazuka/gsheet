@@ -13,7 +13,7 @@ use std::{
 use bytes::Bytes;
 use heed::{
     Database, Env, EnvOpenOptions,
-    types::{Bytes as HeedBytes, SerdeBincode, Str, Unit},
+    types::{Bytes as HeedBytes, Str, Unit},
 };
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::http::HeaderValue;
@@ -31,8 +31,11 @@ use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde::{
+    Deserialize, Serialize,
+    ser::{SerializeMap, SerializeSeq, Serializer as _},
+};
+use serde_json::{Map, Serializer, Value, json};
 use tokio::{
     sync::{Mutex, Notify, Semaphore},
     time::{Instant, sleep},
@@ -54,7 +57,7 @@ const CACHE_DB: &str = "cache";
 const EXPIRY_DB: &str = "expiry";
 
 type ResBody = Full<Bytes>;
-type CacheDb = Database<Str, SerdeBincode<CacheEntry>>;
+type CacheDb = Database<Str, HeedBytes>;
 type ExpiryDb = Database<HeedBytes, Unit>;
 type CacheResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Empty<Bytes>>;
@@ -71,6 +74,7 @@ static DOCUMENT_CACHE_CONTROL: OnceLock<String> = OnceLock::new();
 static ERROR_CACHE_CONTROL: OnceLock<String> = OnceLock::new();
 static GOOGLE_QUEUE: OnceLock<Semaphore> = OnceLock::new();
 static GOOGLE_RECENT: OnceLock<Mutex<VecDeque<Instant>>> = OnceLock::new();
+static LAST_CACHE_PURGE_AT: AtomicU64 = AtomicU64::new(0);
 
 struct State {
     http: HttpClient,
@@ -239,25 +243,36 @@ async fn route_request(method: &Method, uri: &hyper::Uri) -> Response<ResBody> {
 
 async fn fetch_sheet_json(spreadsheet_id: &str, sheet_name: &str) -> Result<Vec<u8>, GoogleError> {
     let body = fetch_values_bytes(spreadsheet_id, sheet_name).await?;
-    let rows = values_to_rows(parse_sheet_values(&body)?.values.unwrap_or_default());
-    serde_json::to_vec(&rows).map_err(GoogleError::json_encode)
+    values_to_rows_json(parse_shaped_sheet_values(&body)?.values.unwrap_or_default())
+        .map_err(GoogleError::json_encode)
 }
 
 async fn fetch_document_json(spreadsheet_id: &str) -> Result<Vec<u8>, GoogleError> {
     let metadata = fetch_spreadsheet_metadata(spreadsheet_id).await?;
-    let mut document = Map::with_capacity(metadata.sheets.len());
+    let mut body = Vec::new();
+    let mut serializer = Serializer::new(&mut body);
+    let mut document = serializer
+        .serialize_map(Some(metadata.sheets.len()))
+        .map_err(GoogleError::json_encode)?;
 
     for sheet in metadata.sheets {
-        let body = fetch_values_bytes(spreadsheet_id, &sheet.properties.title).await?;
-        document.insert(
-            sheet.properties.title,
-            Value::Array(values_to_rows(
-                parse_sheet_values(&body)?.values.unwrap_or_default(),
-            )),
-        );
+        let values = parse_shaped_sheet_values(
+            &fetch_values_bytes(spreadsheet_id, &sheet.properties.title).await?,
+        )?
+        .values
+        .unwrap_or_default();
+        document
+            .serialize_entry(
+                &sheet.properties.title,
+                &RowsJson {
+                    values: values.as_slice(),
+                },
+            )
+            .map_err(GoogleError::json_encode)?;
     }
 
-    serde_json::to_vec(&document).map_err(GoogleError::json_encode)
+    SerializeMap::end(document).map_err(GoogleError::json_encode)?;
+    Ok(body)
 }
 
 async fn fetch_document_raw_json(spreadsheet_id: &str) -> Result<Bytes, GoogleError> {
@@ -354,7 +369,7 @@ async fn fetch_values_bytes(spreadsheet_id: &str, sheet_name: &str) -> Result<By
             }
 
             let (status, body) = fetch_json(&url).await?;
-            parse_sheet_values(&body)?;
+            parse_google_error(&body)?;
             if status != StatusCode::OK {
                 return Err(GoogleError::bad_request("Google Sheets request failed"));
             }
@@ -419,40 +434,59 @@ impl HeedCache {
     }
 
     fn get(&self, kind: &str, key: &str) -> CacheResult<Option<Bytes>> {
-        self.purge_expired()?;
+        self.maybe_purge_expired()?;
         let rtxn = self.env.read_txn()?;
         let key = cache_key_prefix(kind, key);
-        Ok(self
-            .entries
-            .get(&rtxn, &key)?
-            .map(|entry| Bytes::from(entry.body)))
+        let Some(entry) = self.entries.get(&rtxn, &key)? else {
+            return Ok(None);
+        };
+        let expires_at_unix_seconds = decode_expires_at(entry)?;
+        if expires_at_unix_seconds <= now_unix_seconds() {
+            drop(rtxn);
+            self.delete_entry(&key, expires_at_unix_seconds)?;
+            return Ok(None);
+        }
+        Ok(Some(Bytes::copy_from_slice(
+            entry.get(8..).ok_or("invalid cache entry")?,
+        )))
     }
 
     fn put(&self, kind: &str, key: &str, body: &Bytes, ttl_seconds: u64) -> CacheResult<()> {
-        self.purge_expired()?;
+        self.maybe_purge_expired()?;
         let key = cache_key_prefix(kind, key);
 
         let expires_at_unix_seconds = now_unix_seconds() + ttl_seconds;
-        let entry = CacheEntry {
-            body: body.to_vec(),
-            expires_at_unix_seconds,
-        };
+        let entry = encode_cache_entry(expires_at_unix_seconds, body);
 
         let mut wtxn = self.env.write_txn()?;
         if let Some(previous) = self.entries.get(&wtxn, &key)? {
-            let previous_expiry_key = expiry_key(previous.expires_at_unix_seconds, &key);
+            let previous_expiry_key = expiry_key(decode_expires_at(previous)?, &key);
             self.expiry
                 .delete(&mut wtxn, previous_expiry_key.as_slice())?;
         }
-        self.entries.put(&mut wtxn, &key, &entry)?;
+        self.entries.put(&mut wtxn, &key, entry.as_slice())?;
         let expiry_key = expiry_key(expires_at_unix_seconds, &key);
         self.expiry.put(&mut wtxn, expiry_key.as_slice(), &())?;
         wtxn.commit()?;
         Ok(())
     }
 
-    fn purge_expired(&self) -> CacheResult<()> {
+    fn maybe_purge_expired(&self) -> CacheResult<()> {
         let now = now_unix_seconds();
+        let last_purge = LAST_CACHE_PURGE_AT.load(Ordering::Relaxed);
+        if now.saturating_sub(last_purge) < 60 {
+            return Ok(());
+        }
+        if LAST_CACHE_PURGE_AT
+            .compare_exchange(last_purge, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return Ok(());
+        }
+        self.purge_expired(now)
+    }
+
+    fn purge_expired(&self, now: u64) -> CacheResult<()> {
         let mut upper_bound = Vec::with_capacity(9);
         upper_bound.extend_from_slice(&now.to_be_bytes());
         upper_bound.push(0xff);
@@ -483,12 +517,17 @@ impl HeedCache {
         wtxn.commit()?;
         Ok(())
     }
-}
 
-#[derive(Clone, Deserialize, Serialize)]
-struct CacheEntry {
-    body: Vec<u8>,
-    expires_at_unix_seconds: u64,
+    fn delete_entry(&self, key: &str, expires_at_unix_seconds: u64) -> CacheResult<()> {
+        let mut wtxn = self.env.write_txn()?;
+        self.entries.delete(&mut wtxn, key)?;
+        self.expiry.delete(
+            &mut wtxn,
+            expiry_key(expires_at_unix_seconds, key).as_slice(),
+        )?;
+        wtxn.commit()?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Default)]
@@ -599,7 +638,18 @@ fn parse_metadata(body: &[u8]) -> Result<SpreadsheetMetadataResponse, GoogleErro
     Ok(payload)
 }
 
-fn parse_sheet_values(body: &[u8]) -> Result<SheetValuesResponse, GoogleError> {
+fn parse_google_error(body: &[u8]) -> Result<(), GoogleError> {
+    let payload: GoogleErrorResponse =
+        serde_json::from_slice(body).map_err(GoogleError::json_decode)?;
+
+    if let Some(error) = payload.error.as_ref() {
+        return Err(GoogleError::bad_request(error.message.clone()));
+    }
+
+    Ok(())
+}
+
+fn parse_shaped_sheet_values(body: &[u8]) -> Result<SheetValuesResponse, GoogleError> {
     let payload: SheetValuesResponse =
         serde_json::from_slice(body).map_err(GoogleError::json_decode)?;
 
@@ -610,27 +660,13 @@ fn parse_sheet_values(body: &[u8]) -> Result<SheetValuesResponse, GoogleError> {
     Ok(payload)
 }
 
-fn values_to_rows(values: Vec<Vec<Value>>) -> Vec<Value> {
-    let mut rows = values.into_iter();
-    let Some(headers) = rows.next() else {
-        return Vec::new();
-    };
-
-    let mut shaped = Vec::with_capacity(rows.len());
-    for row in rows {
-        let mut object = Map::with_capacity(row.len());
-        for (index, item) in row.into_iter().enumerate() {
-            let key = headers
-                .get(index)
-                .and_then(Value::as_str)
-                .unwrap_or("undefined")
-                .to_owned();
-            object.insert(key, item);
-        }
-        shaped.push(Value::Object(object));
+fn values_to_rows_json(values: Vec<Vec<String>>) -> Result<Vec<u8>, serde_json::Error> {
+    let mut body = Vec::new();
+    RowsJson {
+        values: values.as_slice(),
     }
-
-    shaped
+    .serialize(&mut Serializer::new(&mut body))?;
+    Ok(body)
 }
 
 fn expiry_key(expires_at_unix_seconds: u64, cache_key: &str) -> Vec<u8> {
@@ -647,6 +683,22 @@ fn cache_key_prefix(kind: &str, key: &str) -> String {
     prefixed.push(':');
     prefixed.push_str(key);
     prefixed
+}
+
+fn encode_cache_entry(expires_at_unix_seconds: u64, body: &Bytes) -> Vec<u8> {
+    let mut entry = Vec::with_capacity(8 + body.len());
+    entry.extend_from_slice(&expires_at_unix_seconds.to_be_bytes());
+    entry.extend_from_slice(body.as_ref());
+    entry
+}
+
+fn decode_expires_at(entry: &[u8]) -> CacheResult<u64> {
+    let Some(prefix) = entry.get(..8) else {
+        return Err("invalid cache entry".into());
+    };
+    Ok(u64::from_be_bytes(
+        prefix.try_into().map_err(|_| "invalid cache entry")?,
+    ))
 }
 
 async fn acquire_google_slot() -> Result<(), GoogleError> {
@@ -835,8 +887,61 @@ struct SpreadsheetSheetProperties {
 
 #[derive(Deserialize)]
 struct SheetValuesResponse {
-    values: Option<Vec<Vec<Value>>>,
+    values: Option<Vec<Vec<String>>>,
     error: Option<GoogleApiError>,
+}
+
+#[derive(Deserialize)]
+struct GoogleErrorResponse {
+    error: Option<GoogleApiError>,
+}
+
+struct RowsJson<'a> {
+    values: &'a [Vec<String>],
+}
+
+impl Serialize for RowsJson<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let Some((headers, rows)) = self.values.split_first() else {
+            return serializer.serialize_seq(Some(0))?.end();
+        };
+
+        let mut seq = serializer.serialize_seq(Some(rows.len()))?;
+        for row in rows {
+            seq.serialize_element(&RowJson {
+                headers,
+                row: row.as_slice(),
+            })?;
+        }
+        seq.end()
+    }
+}
+
+struct RowJson<'a> {
+    headers: &'a [String],
+    row: &'a [String],
+}
+
+impl Serialize for RowJson<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.row.len()))?;
+        for (index, item) in self.row.iter().enumerate() {
+            map.serialize_entry(
+                self.headers
+                    .get(index)
+                    .map(String::as_str)
+                    .unwrap_or("undefined"),
+                item,
+            )?;
+        }
+        map.end()
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -864,6 +969,7 @@ mod tests {
 
     fn test_state() -> TempDir {
         let dir = tempdir().expect("tempdir");
+        LAST_CACHE_PURGE_AT.store(0, Ordering::Relaxed);
         GOOGLE_CACHE_TTL_SECS.store(DEFAULT_GOOGLE_CACHE_TTL_SECS, Ordering::Relaxed);
         GOOGLE_CACHE_TTL_MAX_SECS.store(DEFAULT_GOOGLE_CACHE_TTL_MAX_SECS, Ordering::Relaxed);
         GOOGLE_RATE_LIMIT.store(DEFAULT_GOOGLE_RATE_LIMIT, Ordering::Relaxed);
@@ -901,6 +1007,7 @@ mod tests {
         let _ = dotenvy::dotenv();
         let api_key = env::var("GOOGLE_API_KEY").ok()?;
         let dir = tempdir().ok()?;
+        LAST_CACHE_PURGE_AT.store(0, Ordering::Relaxed);
         GOOGLE_CACHE_TTL_SECS.store(DEFAULT_GOOGLE_CACHE_TTL_SECS, Ordering::Relaxed);
         GOOGLE_CACHE_TTL_MAX_SECS.store(DEFAULT_GOOGLE_CACHE_TTL_MAX_SECS, Ordering::Relaxed);
         GOOGLE_RATE_LIMIT.store(DEFAULT_GOOGLE_RATE_LIMIT, Ordering::Relaxed);
@@ -1291,6 +1398,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let cache = HeedCache::open(dir.path()).expect("open cache");
         let payload = Bytes::from_static(b"payload");
+        LAST_CACHE_PURGE_AT.store(0, Ordering::Relaxed);
 
         cache
             .put("m", "metadata:test", &payload, 0)
@@ -1313,6 +1421,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let cache = HeedCache::open(dir.path()).expect("open cache");
         let payload = Bytes::from_static(b"payload");
+        LAST_CACHE_PURGE_AT.store(0, Ordering::Relaxed);
 
         cache
             .put("v", "values:expired", &payload, 1)
@@ -1326,10 +1435,14 @@ mod tests {
                 .get(&rtxn, prefixed_key.as_str())
                 .expect("raw expired value get")
                 .expect("expired value entry");
-            expiry_key(entry.expires_at_unix_seconds, prefixed_key.as_str())
+            expiry_key(
+                decode_expires_at(entry).expect("expired entry expiry"),
+                prefixed_key.as_str(),
+            )
         };
 
         thread::sleep(Duration::from_secs(1));
+        LAST_CACHE_PURGE_AT.store(0, Ordering::Relaxed);
 
         cache
             .put("v", "values:fresh", &payload, 60)

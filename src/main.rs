@@ -62,6 +62,18 @@ type ExpiryDb = Database<HeedBytes, Unit>;
 type CacheResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Empty<Bytes>>;
 
+#[cfg(debug_assertions)]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        eprintln!("[debug] {}", format_args!($($arg)*));
+    };
+}
+
+#[cfg(not(debug_assertions))]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {};
+}
+
 static STATE: OnceLock<State> = OnceLock::new();
 static GOOGLE_CACHE_TTL_SECS: AtomicU64 = AtomicU64::new(DEFAULT_GOOGLE_CACHE_TTL_SECS);
 static GOOGLE_CACHE_TTL_MAX_SECS: AtomicU64 = AtomicU64::new(DEFAULT_GOOGLE_CACHE_TTL_MAX_SECS);
@@ -171,6 +183,8 @@ async fn route_request(method: &Method, uri: &hyper::Uri) -> Response<ResBody> {
 
     let path = uri.path().trim_matches('/');
 
+    debug_log!("route_request method={method} uri={uri} path={path}");
+
     if path.is_empty() {
         let mut response = Response::new(Full::new(Bytes::new()));
         *response.status_mut() = StatusCode::FOUND;
@@ -215,6 +229,10 @@ async fn route_request(method: &Method, uri: &hyper::Uri) -> Response<ResBody> {
             Ok(sheet_name) => sheet_name,
             Err(error) => return error_response(error.message, error.status),
         };
+
+        debug_log!(
+            "route_request spreadsheet_id={id} raw={raw} sheet_param={sheet} decoded_sheet_name={sheet_name}"
+        );
 
         if raw {
             fetch_values_bytes(id, &sheet_name).await
@@ -300,6 +318,10 @@ fn decode_sheet_name(sheet_param: &str) -> Result<String, GoogleError> {
         .map(|decoded| decoded.into_owned())
         .map_err(|_| GoogleError::bad_request("Invalid sheet path encoding"))?;
 
+    debug_log!(
+        "decode_sheet_name sheet_param={sheet_param} normalized={normalized} decoded={decoded}"
+    );
+
     Ok(decoded)
 }
 
@@ -310,13 +332,18 @@ async fn fetch_spreadsheet_metadata(
     let cache_key = format!("metadata:{spreadsheet_id}");
 
     if let Some(body) = app.cache.get("m", &cache_key).map_err(GoogleError::cache)? {
+        debug_log!("metadata cache_hit key={cache_key} bytes={}", body.len());
         return parse_metadata(&body);
     }
+
+    debug_log!("metadata cache_miss key={cache_key}");
 
     let url = format!(
         "https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}?key={}",
         app.api_key
     );
+
+    debug_log!("metadata upstream_url={url}");
 
     let body = app
         .inflight
@@ -324,10 +351,19 @@ async fn fetch_spreadsheet_metadata(
             let app = state();
 
             if let Some(body) = app.cache.get("m", &cache_key).map_err(GoogleError::cache)? {
+                debug_log!(
+                    "metadata cache_hit_after_wait key={cache_key} bytes={}",
+                    body.len()
+                );
                 return Ok(body);
             }
 
             let (status, body) = fetch_json(&url).await?;
+            debug_log!(
+                "metadata upstream_status={} bytes={}",
+                status.as_u16(),
+                body.len()
+            );
             let payload = parse_metadata(&body)?;
             if status != StatusCode::OK {
                 drop(payload);
@@ -351,8 +387,11 @@ async fn fetch_values_bytes(spreadsheet_id: &str, sheet_name: &str) -> Result<By
     let cache_key = format!("values:{spreadsheet_id}:{sheet_name}");
 
     if let Some(body) = app.cache.get("v", &cache_key).map_err(GoogleError::cache)? {
+        debug_log!("values cache_hit key={cache_key} bytes={}", body.len());
         return Ok(body);
     }
+
+    debug_log!("values cache_miss key={cache_key}");
 
     let url = format!(
         "https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{}?key={}",
@@ -360,15 +399,26 @@ async fn fetch_values_bytes(spreadsheet_id: &str, sheet_name: &str) -> Result<By
         app.api_key
     );
 
+    debug_log!("values upstream_url={url}");
+
     app.inflight
         .run(cache_key.clone(), || async {
             let app = state();
 
             if let Some(body) = app.cache.get("v", &cache_key).map_err(GoogleError::cache)? {
+                debug_log!(
+                    "values cache_hit_after_wait key={cache_key} bytes={}",
+                    body.len()
+                );
                 return Ok(body);
             }
 
             let (status, body) = fetch_json(&url).await?;
+            debug_log!(
+                "values upstream_status={} bytes={}",
+                status.as_u16(),
+                body.len()
+            );
             parse_google_error(&body)?;
             if status != StatusCode::OK {
                 return Err(GoogleError::bad_request("Google Sheets request failed"));
@@ -386,6 +436,7 @@ async fn fetch_json(url: &str) -> Result<(StatusCode, Bytes), GoogleError> {
     acquire_google_slot().await?;
 
     let app = state();
+    debug_log!("fetch_json request_url={url}");
     let request = Request::builder()
         .method(Method::GET)
         .uri(url)
@@ -405,6 +456,12 @@ async fn fetch_json(url: &str) -> Result<(StatusCode, Bytes), GoogleError> {
         .await
         .map_err(GoogleError::body_read)?
         .to_bytes();
+
+    debug_log!(
+        "fetch_json response_status={} response_bytes={}",
+        status.as_u16(),
+        body.len()
+    );
 
     Ok((status, body))
 }

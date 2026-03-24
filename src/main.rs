@@ -38,7 +38,7 @@ use serde::{
 use serde_json::{Map, Serializer, Value, json};
 use tokio::{
     sync::{Mutex, Notify, Semaphore},
-    time::{Instant, sleep},
+    time::{Instant, sleep, timeout},
 };
 
 const README_URL: &str = "https://github.com/devazuka/gsheet#readme";
@@ -53,6 +53,7 @@ const DEFAULT_GOOGLE_CACHE_TTL_MAX_SECS: u64 = 1200;
 const DEFAULT_GOOGLE_RATE_LIMIT: usize = 300;
 const DEFAULT_GOOGLE_RATE_WINDOW_SECS: u64 = 60;
 const DEFAULT_GOOGLE_MAX_QUEUED_REQUESTS: usize = 64;
+const GOOGLE_FETCH_TIMEOUT_SECS: u64 = 10;
 const CACHE_DB: &str = "cache";
 const EXPIRY_DB: &str = "expiry";
 
@@ -437,25 +438,36 @@ async fn fetch_json(url: &str) -> Result<(StatusCode, Bytes), GoogleError> {
 
     let app = state();
     debug_log!("fetch_json request_url={url}");
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri(url)
-        .header("accept", "application/json")
-        .body(Empty::new())
-        .map_err(GoogleError::request_build)?;
+    let (status, body) = timeout(Duration::from_secs(GOOGLE_FETCH_TIMEOUT_SECS), async {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(url)
+            .header("accept", "application/json")
+            .body(Empty::new())
+            .map_err(GoogleError::request_build)?;
 
-    let response = app
-        .http
-        .request(request)
-        .await
-        .map_err(GoogleError::upstream)?;
-    let status = response.status();
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .map_err(GoogleError::body_read)?
-        .to_bytes();
+        let response = app
+            .http
+            .request(request)
+            .await
+            .map_err(GoogleError::upstream)?;
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(GoogleError::body_read)?
+            .to_bytes();
+
+        Ok::<_, GoogleError>((status, body))
+    })
+    .await
+    .map_err(|_| {
+        GoogleError::timeout(format!(
+            "Google request timed out after {} seconds",
+            GOOGLE_FETCH_TIMEOUT_SECS
+        ))
+    })??;
 
     debug_log!(
         "fetch_json response_status={} response_bytes={}",
@@ -921,6 +933,13 @@ impl GoogleError {
         Self {
             message: message.into(),
             status: StatusCode::TOO_MANY_REQUESTS,
+        }
+    }
+
+    fn timeout(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            status: StatusCode::GATEWAY_TIMEOUT,
         }
     }
 }

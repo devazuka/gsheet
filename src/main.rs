@@ -134,6 +134,11 @@ async fn main() {
         "public, max-age={error_max_age_secs}, s-maxage={error_max_age_secs}"
     ));
 
+    debug_log!(
+        "startup port={port} cache_dir={} sheet_max_age_secs={sheet_max_age_secs} document_max_age_secs={document_max_age_secs} error_max_age_secs={error_max_age_secs} google_cache_ttl_secs={google_cache_ttl_secs} google_cache_ttl_max_secs={google_cache_ttl_max_secs} google_rate_limit={google_rate_limit} google_rate_window_secs={google_rate_window_secs} google_max_queued_requests={google_max_queued_requests} fetch_timeout_secs={GOOGLE_FETCH_TIMEOUT_SECS}",
+        env::var("CACHE_DIR").unwrap_or_else(|_| "./data/heed".to_string())
+    );
+
     let http = Client::builder(TokioExecutor::new()).build(
         HttpsConnectorBuilder::new()
             .with_webpki_roots()
@@ -156,13 +161,16 @@ async fn main() {
         .expect("failed to bind TCP listener");
 
     println!("Server running on http://localhost:{port}");
+    debug_log!("listener_ready addr={addr}");
 
     loop {
         let (stream, _) = listener.accept().await.expect("failed to accept socket");
         let io = TokioIo::new(stream);
+        debug_log!("connection_accepted listener_addr={addr}");
 
         tokio::spawn(async move {
             let service = service_fn(|request: Request<Incoming>| async move {
+                debug_log!("request_received method={} uri={}", request.method(), request.uri());
                 Ok::<_, Infallible>(route_request(request.method(), request.uri()).await)
             });
 
@@ -178,13 +186,13 @@ fn state() -> &'static State {
 }
 
 async fn route_request(method: &Method, uri: &hyper::Uri) -> Response<ResBody> {
+    let started_at = Instant::now();
+    let path = uri.path().trim_matches('/');
+    debug_log!("route_start method={method} uri={uri} path={path}");
+
     if method != Method::GET {
         return error_response(ROUTE_FORMAT.to_owned(), StatusCode::NOT_FOUND);
     }
-
-    let path = uri.path().trim_matches('/');
-
-    debug_log!("route_request method={method} uri={uri} path={path}");
 
     if path.is_empty() {
         let mut response = Response::new(Full::new(Bytes::new()));
@@ -192,12 +200,14 @@ async fn route_request(method: &Method, uri: &hyper::Uri) -> Response<ResBody> {
         response
             .headers_mut()
             .insert(LOCATION, HeaderValue::from_static(README_URL));
+        debug_log!("route_end method={method} uri={uri} status=302 elapsed_ms={}", started_at.elapsed().as_millis());
         return response;
     }
 
     if path == "up" {
         let mut response = Response::new(Full::new(Bytes::from_static(b"ok")));
         *response.status_mut() = StatusCode::OK;
+        debug_log!("route_end method={method} uri={uri} status=200 elapsed_ms={}", started_at.elapsed().as_millis());
         return response;
     }
 
@@ -246,7 +256,7 @@ async fn route_request(method: &Method, uri: &hyper::Uri) -> Response<ResBody> {
         fetch_document_json(id).await.map(Bytes::from)
     };
 
-    match result {
+    let response = match result {
         Ok(body) => json_response(
             StatusCode::OK,
             if sheet.is_some() {
@@ -257,7 +267,13 @@ async fn route_request(method: &Method, uri: &hyper::Uri) -> Response<ResBody> {
             body,
         ),
         Err(error) => error_response(error.message, error.status),
-    }
+    };
+    debug_log!(
+        "route_end method={method} uri={uri} status={} elapsed_ms={}",
+        response.status().as_u16(),
+        started_at.elapsed().as_millis()
+    );
+    response
 }
 
 async fn fetch_sheet_json(spreadsheet_id: &str, sheet_name: &str) -> Result<Vec<u8>, GoogleError> {
@@ -337,14 +353,14 @@ async fn fetch_spreadsheet_metadata(
         return parse_metadata(&body);
     }
 
-    debug_log!("metadata cache_miss key={cache_key}");
+    debug_log!("metadata cache_miss key={cache_key} spreadsheet_id={spreadsheet_id}");
 
     let url = format!(
         "https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}?key={}",
         app.api_key
     );
 
-    debug_log!("metadata upstream_url={url}");
+    debug_log!("metadata upstream_url={url} spreadsheet_id={spreadsheet_id}");
 
     let body = app
         .inflight
@@ -392,7 +408,7 @@ async fn fetch_values_bytes(spreadsheet_id: &str, sheet_name: &str) -> Result<By
         return Ok(body);
     }
 
-    debug_log!("values cache_miss key={cache_key}");
+    debug_log!("values cache_miss key={cache_key} spreadsheet_id={spreadsheet_id} sheet_name={sheet_name}");
 
     let url = format!(
         "https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{}?key={}",
@@ -400,7 +416,7 @@ async fn fetch_values_bytes(spreadsheet_id: &str, sheet_name: &str) -> Result<By
         app.api_key
     );
 
-    debug_log!("values upstream_url={url}");
+    debug_log!("values upstream_url={url} spreadsheet_id={spreadsheet_id} sheet_name={sheet_name}");
 
     app.inflight
         .run(cache_key.clone(), || async {
@@ -437,7 +453,8 @@ async fn fetch_json(url: &str) -> Result<(StatusCode, Bytes), GoogleError> {
     acquire_google_slot().await?;
 
     let app = state();
-    debug_log!("fetch_json request_url={url}");
+    let started_at = Instant::now();
+    debug_log!("fetch_json_start request_url={url}");
     let (status, body) = timeout(Duration::from_secs(GOOGLE_FETCH_TIMEOUT_SECS), async {
         let request = Request::builder()
             .method(Method::GET)
@@ -470,9 +487,10 @@ async fn fetch_json(url: &str) -> Result<(StatusCode, Bytes), GoogleError> {
     })??;
 
     debug_log!(
-        "fetch_json response_status={} response_bytes={}",
+        "fetch_json_end response_status={} response_bytes={} elapsed_ms={}",
         status.as_u16(),
-        body.len()
+        body.len(),
+        started_at.elapsed().as_millis()
     );
 
     Ok((status, body))

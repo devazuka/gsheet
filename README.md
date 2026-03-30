@@ -40,6 +40,15 @@ By default this pulls `ghcr.io/devazuka/gsheet:latest`.
 
 The service listens on `http://localhost:8080` by default and stores its LMDB cache in the `gsheet-data` Docker volume.
 
+## Run in Debug Mode
+Then run:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.debug.yml up --build
+```
+
+This builds a debug binary inside Docker and runs `/app/target/debug/gsheet`, so the host does not need `cargo`.
+
 ## Run without Docker
 
 ```sh

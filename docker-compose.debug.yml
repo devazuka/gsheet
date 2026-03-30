@@ -1,0 +1,6 @@
+services:
+  gsheet:
+    build:
+      context: .
+      target: debug
+    command: /app/target/debug/gsheet

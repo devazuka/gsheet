@@ -8,6 +8,9 @@ COPY src ./src
 
 RUN cargo build --release
 
+FROM build AS debug
+RUN cargo build
+
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates \
     && addgroup -S app \

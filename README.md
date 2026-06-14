@@ -105,6 +105,7 @@ docker compose up -d
 - `GET /:id/:sheet`
 - `GET /raw/:id`
 - `GET /raw/:id/:sheet`
+- `GET /refresh/:id/:sheet` refreshes one sheet page on the next read by removing its cached upstream Google values
 
 ## Benchmarks
 

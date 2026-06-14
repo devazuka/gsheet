@@ -43,8 +43,7 @@ use tokio::{
 
 const README_URL: &str = "https://github.com/devazuka/gsheet#readme";
 const BASE_ALLOWED_HEADERS: &str = "Origin, X-Requested-With, Content-Type, Accept";
-const ROUTE_FORMAT: &str =
-    "URL format is /spreadsheet_id[/sheet_name] or /raw/spreadsheet_id[/sheet_name]";
+const ROUTE_FORMAT: &str = "URL format is /spreadsheet_id[/sheet_name], /raw/spreadsheet_id[/sheet_name], or /refresh/spreadsheet_id/sheet_name";
 const DEFAULT_SHEET_MAX_AGE_SECS: u64 = 300;
 const DEFAULT_DOCUMENT_MAX_AGE_SECS: u64 = 3600;
 const DEFAULT_ERROR_MAX_AGE_SECS: u64 = 30;
@@ -219,6 +218,12 @@ async fn route_request(method: &Method, uri: &hyper::Uri) -> Response<ResBody> {
     }
 
     let mut path = path;
+    let refresh_cache = if let Some(refresh_path) = path.strip_prefix("refresh/") {
+        path = refresh_path;
+        true
+    } else {
+        false
+    };
     let raw = if let Some(raw_path) = path.strip_prefix("raw/") {
         path = raw_path;
         true
@@ -233,6 +238,17 @@ async fn route_request(method: &Method, uri: &hyper::Uri) -> Response<ResBody> {
 
     if id.is_empty() || sheet.is_some_and(str::is_empty) || parts.next().is_some() {
         return error_response(ROUTE_FORMAT.to_owned(), StatusCode::NOT_FOUND);
+    }
+
+    if refresh_cache {
+        let Some(sheet) = sheet else {
+            return error_response(ROUTE_FORMAT.to_owned(), StatusCode::NOT_FOUND);
+        };
+        let sheet_name = match decode_sheet_name(sheet) {
+            Ok(sheet_name) => sheet_name,
+            Err(error) => return error_response(error.message, error.status),
+        };
+        return refresh_sheet_cache(id, &sheet_name);
     }
 
     let result = if let Some(sheet) = sheet {
@@ -274,6 +290,22 @@ async fn route_request(method: &Method, uri: &hyper::Uri) -> Response<ResBody> {
         started_at.elapsed().as_millis()
     );
     response
+}
+
+fn refresh_sheet_cache(spreadsheet_id: &str, sheet_name: &str) -> Response<ResBody> {
+    let cache_key = format!("values:{spreadsheet_id}:{sheet_name}");
+    match state().cache.delete("v", &cache_key) {
+        Ok(refreshed) => json_response(
+            StatusCode::OK,
+            "no-store",
+            serde_json::to_vec(&json!({ "refreshed": refreshed }))
+                .expect("serialize refresh response"),
+        ),
+        Err(error) => error_response(
+            GoogleError::cache(error).message,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
 }
 
 async fn fetch_sheet_json(spreadsheet_id: &str, sheet_name: &str) -> Result<Vec<u8>, GoogleError> {
@@ -556,6 +588,23 @@ impl HeedCache {
         self.expiry.put(&mut wtxn, expiry_key.as_slice(), &())?;
         wtxn.commit()?;
         Ok(())
+    }
+
+    fn delete(&self, kind: &str, key: &str) -> CacheResult<bool> {
+        self.maybe_purge_expired()?;
+        let key = cache_key_prefix(kind, key);
+
+        let mut wtxn = self.env.write_txn()?;
+        let Some(previous) = self.entries.get(&wtxn, &key)? else {
+            return Ok(false);
+        };
+
+        let previous_expiry_key = expiry_key(decode_expires_at(previous)?, &key);
+        self.entries.delete(&mut wtxn, &key)?;
+        self.expiry
+            .delete(&mut wtxn, previous_expiry_key.as_slice())?;
+        wtxn.commit()?;
+        Ok(true)
     }
 
     fn maybe_purge_expired(&self) -> CacheResult<()> {
@@ -1270,6 +1319,44 @@ mod tests {
             )
         );
         assert_eq!(body, raw_body);
+    }
+
+    #[tokio::test]
+    async fn refreshes_cached_google_values_for_sheet_page() {
+        let _cache_dir = test_state();
+        let spreadsheet_id = "spreadsheet-refresh";
+        let cache_key = format!("values:{spreadsheet_id}:Sheet One");
+        state()
+            .cache
+            .put(
+                "v",
+                &cache_key,
+                &Bytes::from_static(br#"{"values":[["name"],["alice"]]}"#),
+                60,
+            )
+            .expect("put values");
+
+        let uri: hyper::Uri = format!("/refresh/{spreadsheet_id}/Sheet%20One")
+            .parse()
+            .expect("uri");
+        let response = route_request(&Method::GET, &uri).await;
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, Bytes::from_static(br#"{"refreshed":true}"#));
+        assert_eq!(
+            state()
+                .cache
+                .get("v", &cache_key)
+                .expect("get refreshed value"),
+            None
+        );
     }
 
     #[tokio::test]

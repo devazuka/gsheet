@@ -40,6 +40,9 @@ Used for every successful sheet data request once the sheet title is known.
   - returns all raw Google values payloads keyed by sheet title
 - `GET /raw/:id/:sheet`
   - returns one raw Google values payload
+- `GET /refresh/:id/:sheet`
+  - deletes the cached upstream Google values payload for one sheet page so the next read fetches fresh data
+  - returns `{"refreshed":true}` when an entry was removed, or `{"refreshed":false}` when no entry existed
 - trailing `/` characters are ignored on all routes
 - all other paths
   - return a JSON error with status `404`
